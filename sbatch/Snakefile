@@ -1,0 +1,53 @@
+import glob
+import sys
+import os
+
+epis = "H3K27ac,DNase,H3K4me1,H3K4me3,H3K4me2,H3K27me3,H3K36me3,H3K9me3,ATAC-seq,H3K9ac".split(",")
+
+SYMBOLS = []
+sps = []
+print(config)
+print(config.keys())
+if config.get('gene_list', 'fail') == 'fail':
+    os.system("rm -rf .snakemake")  ## --unlock option failed...
+    sys.exit(0)
+with open(config.get('gene_list', 'fail')) as fin:
+    for line in fin:
+        SYMBOLS.append(line.strip())
+        sps.append(line.strip().split(".")[1])
+
+TARGETS = expand("{sample}_{sp}_html", zip, sample=SYMBOLS, sp=sps)
+##TARGETS = TARGETS[:3]
+print(TARGETS)
+
+print(sps)
+print(epis)
+
+rule all:
+    input: TARGETS
+
+rule clean:
+    shell: "rm -rf *fs* *delta* *coef *margerp *json *_html *log"
+
+rule lisa:
+    input:
+        "{sample}"
+    output:
+        "{sample}_DNase_{epi}_{sp}"
+    log:
+        "{sample}_{epi}.log"
+    shell:
+        "echo {wildcards.epi} {wildcards.sample} && "
+        "lisa logit --histone {wildcards.epi} --gene {input} --tf no --name {wildcards.sample}"
+        " --species {wildcards.sp} -O {output} --top 10 2>{log} "
+
+rule merge_lisa:
+    input:
+        expand("{{sample}}_DNase_{epi}_{{sp}}", epi=epis)
+    output:
+        name="{sample}_{sp}_html"
+    log:
+        "{sample}_merge.log"
+    run:
+        shell("mkdir -p %s && cp -nrf %s %s" % (output.name, ' '.join(map(lambda x: "%s/*"%x, input)), output.name))
+

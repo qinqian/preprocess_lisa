@@ -1,0 +1,8 @@
+channels:
+  - bioconda
+dependencies:
+  - samtools=0.1.19
+  - bwa=0.7.15
+  - ucsc-bigwigaverageoverbed=332
+  - ucsc-bedclip
+  - macs2

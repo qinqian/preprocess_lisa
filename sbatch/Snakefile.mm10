@@ -1,0 +1,24 @@
+import glob
+import os
+
+SYMBOLS = list(map(lambda x: x.split('.')[0], glob.glob("mm10/*mm10")))
+
+TARGETS = expand(os.path.expanduser("marge2/{sample}nodnase_10sample"), sample=SYMBOLS)
+
+
+rule all:
+    input: TARGETS
+
+rule lisa:
+    input:
+        "{sample}.mm10"
+    output:
+        "marge2/{sample}nodnase_10sample"
+    params:
+        name="{sample}"
+    log:
+        "{sample}.log"
+    shell:
+        "lisa logit --gene {input} --tf no --name {params.name} "
+        " --histone 'H3K27ac,DNase,H3K4me3,H3K27me3,ATAC-seq' --species mm10 -O {output} --top 10 2>{log} "
+

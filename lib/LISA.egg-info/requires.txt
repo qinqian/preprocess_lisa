@@ -1,0 +1,11 @@
+numpy
+matplotlib
+sklearn
+theano
+h5py
+pandas
+seaborn
+scipy
+snakemake
+PyYAML
+statsmodels

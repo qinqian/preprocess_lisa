@@ -1,0 +1,11 @@
+syntax: glob
+
+*pyc
+*~
+build
+lib/MARGE2.egg-info
+dist
+*so
+*.egg-info
+*_html
+.snakemake

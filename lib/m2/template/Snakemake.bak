@@ -1,0 +1,80 @@
+import os
+import numpy as np
+import gzip
+from pkg_resources import resource_filename
+
+configfile: "$config"
+
+rule all:
+    input:
+        "$html_out/index.html"
+
+rule bwa:
+    input:
+        fq=lambda wildcards: config["samples"][wildcards.sample],
+    output:
+        "sorted_reads/{sample}.bam"
+    params:
+        index=config["index"]
+    threads: 4
+    priority: 50
+    conda:
+        "$conda"
+    log:
+        os.path.join('logs', '$prefix.log')
+    shell:
+        "which bwa && which samtools && lisa_mapping {params.index} {input.fq} {threads} sorted_reads/{wildcards.sample} 2>{log}"
+
+rule bigwiggle:
+    input:
+        bam="sorted_reads/{sample}.bam",
+        chrom="$chrom"
+    output:
+        "bigWigs/{sample}.bw"
+        # protected("bigWigs/{sample}.bw")
+    priority: 30
+    conda:
+        "$conda"
+    log:
+        os.path.join('logs', '$prefix.log')
+    shell:
+        "lisa_bw {input.bam} {input.chrom} {output} 2>>{log}"
+
+rule SampleHDF5:
+    input:
+        bw="bigWigs/{sample}.bw",
+        chrom="$chrom"
+    output:
+        h5=temp("HDF5/{sample}.h5"),
+        rp=temp("RP/{sample}.rp"),
+        ct=temp("Count/{sample}.txt"),
+    priority: 10
+    params:
+        order="$originalorder",
+        sp='$sp',
+        bin1kb='$bin1kb',
+    script:
+        "lisa_h5.py"
+
+rule merge:
+    input:
+        h5=expand("HDF5/{sample}.h5", sample=config["samples"]),
+        chrom="$chrom"
+    output:
+        fh5='$prefix.h5'
+    priority: 5
+    params:
+        prefix="$prefix"
+    script:
+        "lisa_merge.py"
+
+rule KnockOut:
+    input:
+        h5='$prefix.h5'
+    output:
+        report="$html_out/index.html"
+    priority: 1
+    log:
+        os.path.join('logs', '$prefix.log')
+    shell:
+        "lisa logit --histone H3K27ac -O $prefix --name $prefix --gene $gene --tf no --species $sp --additional_h5 {input.h5} 2>>{log}"

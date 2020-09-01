@@ -1,0 +1,21 @@
+#!/bin/bash -ex
+# Run bash with -e exit on first error, -x add +command stream to sterr.
+# Remove -x for cleaner usage message
+
+if [ $# -lt 4 ]
+then
+    echo "too few parameter"
+    exit 1
+fi
+
+echo $#
+
+index=$1
+input=$2
+threads=$3
+prefix=$4
+
+bwa aln -q 5 -l 32 -k 2 -t $threads $index $input > ${prefix}.sai
+bwa samse $index ${prefix}.sai ${input} | samtools view -q 1 -Shu - | samtools sort -m 5000000000 - ${prefix}
+# rm ${prefix}.sam
+rm ${prefix}.sai

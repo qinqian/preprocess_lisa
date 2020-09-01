@@ -1,0 +1,18 @@
+import os
+import glob
+windows="/data/home/qqin/seqpos2/hg38_window100bp.bed"
+
+beds = glob.glob('*bed')
+
+rule all:
+    input: expand('{bed}.index.npy', bed=beds)
+
+rule bedtools_5fold:
+    input:  '{bed}'
+    output: '{bed}.index.npy'
+    params: windows
+    shell: """
+    bedtools intersect -wa -u -b {input} -a {params} | cut -f 4 > {input}.index
+    python -c "import numpy; a=numpy.loadtxt('{input}.index', dtype='int32'); numpy.save('{input}.index', a)"
+    """
+

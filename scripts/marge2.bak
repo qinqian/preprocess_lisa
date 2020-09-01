@@ -1,0 +1,3118 @@
+#!/usr/bin/env python
+import subprocess
+import numpy as np
+import matplotlib
+from itertools import groupby, count
+import math
+matplotlib.use('Agg')
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as p
+import seaborn as sns
+sns.set(style='white')
+sns.set_style({'legend.frameon': False})
+
+from pybedtools import BedTool
+import pybedtools
+from sklearn import linear_model, metrics
+from sklearn.metrics import make_scorer, roc_auc_score
+from sklearn.cluster import KMeans
+from sklearn.grid_search import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectFromModel, RFE
+from sklearn.ensemble import AdaBoostClassifier
+
+from collections import OrderedDict
+import six.moves.cPickle as pickle
+import argparse, sys, random, os, glob, ConfigParser
+
+import h5py
+# import theano
+# import lib
+
+FACTOR = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+def trim(X, qlo=0.0000, qhi=0.9999):
+    s = np.sort(X.values.flatten())
+    slo = s[max(int(qlo*len(s)), 0)]
+    shi = s[min(int(qhi*len(s)), len(s)-1)]
+    X[X < slo] = slo
+    X[X > shi] = shi
+    return X
+
+def profile_cluster_heatmap(seed, repeat_times, X, Y):
+    X = normalize_rp(X.loc[Y.index, :], sqrt=False)
+    X = X.subtract(X.median(1), axis='index')
+
+    train_index, test_index = split_gene(X.index, seed, False)
+    X_train = X.iloc[train_index, :]
+    Y_train = Y.iloc[train_index, :]
+    X_test = X.iloc[test_index, :]
+    Y_test = Y.iloc[test_index, :]
+
+    for diff_i in np.arange(Y.shape[1]):
+        # skip the treatment with so few differential genes
+        # if Y.iloc[:,diff_i].sum() < 300:
+        #     continue
+        # skip if there is a figure
+        if os.path.exists(os.path.join('../figs/', Y_test.columns[diff_i] + '.png')):
+            continue
+
+        # limit our samples to 100 for faster reading union DHS reads......
+        # model, best_C = logit_with_cv(seed, repeat_times, X_train, Y_train.iloc[:, diff_i])
+        maxsamples = 10
+        # col_index = model.named_steps['fs'].transform(np.arange(X_train.shape[1]).reshape(1, -1))[0]
+        # col_index = col_index[np.argsort(np.abs(model.named_steps['clf'].coef_).flatten())[::-1]][:maxsamples]
+        # features = X_train.columns.get_level_values(0)[sorted(col_index)]
+
+        best_C = 0.1
+        repeat_times = 3
+        features_num, features_list = select_features(seed, X_train, Y_train.iloc[:, diff_i],
+                                                      repeat_times, maxsamples=maxsamples)
+        col_index = features_list
+        features = X[features_list].columns.get_level_values(0)
+        k = 7        
+        feature_count = {}
+        factors = [features[0]]
+        for f in features:
+            # keep the factors order to draw rectangle
+            if f != factors[-1]:
+                factors.append(f)
+            feature_count[f] = feature_count.get(f, 0) + 1
+            
+        if isinstance(col_index, np.ndarray):
+            X_train_selected = X_train[col_index]
+            X_test_selected = X_test[col_index]
+        else:
+            X_train_selected = X_train.iloc[:, col_index]
+            X_test_selected = X_test.iloc[:, col_index]
+
+        # clustering for each of the factor
+        # reorder training RP profile and coeffcients
+        clustering_factor_labels = []
+        X_train_new = []
+        
+        for index, factor in enumerate(factors):
+            if index == 0:
+                start = 0
+                end = feature_count[factor]
+            else:
+                start = end
+                end = start + feature_count[factor]
+            if (X_train_selected.iloc[:, start:end].shape[1]>=2):
+                clustering_factor = KMeans(n_clusters = 2, n_init=k, n_jobs=k)
+                clustering_factor.fit(X_train_selected.iloc[:, start:end].values.T)
+                clustering_factor_index = np.argsort(clustering_factor.labels_)
+                clustering_factor_labels.append(clustering_factor.labels_[clustering_factor_index])
+                X_train_new.append(X_train_selected.iloc[:, start:end].iloc[:, clustering_factor_index].copy())
+            else:
+                X_train_new.append(X_train_selected.iloc[:, start:end].copy())
+                clustering_factor_labels.append(0)
+            
+        X_train_selected = pd.concat(X_train_new, axis=1)
+        X_test_selected = X_test_selected.loc[:, X_train_selected.columns]
+        
+        model = logit_with_cv(seed, repeat_times, X_train_selected, Y_train.iloc[:, diff_i], clustering=True, best_C = best_C)
+        coefs = model.coef_
+
+        with open(Y.columns[diff_i] + '__logistic_model.pickle', 'wb') as fout:
+            pickle.dump((X_train_selected.columns, model), fout)
+
+        Y_hat_test = model.predict_log_proba(X_test_selected.values)[:, 1]
+        afpr, atpr, _ = metrics.roc_curve(Y_test.iloc[:,diff_i].values, Y_hat_test, pos_label=1)
+        aauc = metrics.auc(afpr, atpr)
+        fprs = []; tprs = []; aucs = []
+        fprs.append(afpr); tprs.append(atpr); aucs.append('Regression once %s' %(aauc))
+        print(aucs)
+
+        # clustering gene way of RP
+        clustering = KMeans(n_clusters = k, n_init=k, n_jobs=k)
+        clustering.fit(X_train_selected.values)
+
+        # use K Means to predict the samples in
+        # test gene set for the nearest cluster in train gene set
+        # then predict using the corresponding cluster logistic model
+        cluster_index = np.argsort(clustering.labels_)
+        cluster_labels = clustering.labels_[cluster_index]
+        cluster_count = np.unique(cluster_labels, return_counts=True)
+
+        X_train_selected = X_train_selected.iloc[cluster_index,:]
+        diff_list = Y_train.iloc[cluster_index, diff_i]
+        # iterate each cluster label and their count orderly
+        colors = ['light olive', 'cornflower', 'azure', 'scarlet', 'orchid', 'orange red', 'pig pink', 'spruce', 'tealish', 'orange', 'bright green', 'bright blue', 'dark pink', 'purple', 'green', 'pink', 'brown', 'cyan', 'aquamarine', 'red']
+
+        cols = sns.xkcd_palette(colors)
+        start, cluster_ii = 0, 0
+        models = []
+        cluster_test_label = clustering.predict(X_test_selected)
+        clustering_models = []
+        for cl, ccc in zip(*cluster_count):
+            if cluster_ii == 0:
+                end = start + ccc
+            else:
+                start = end
+                end = start + ccc
+            if sum(diff_list[start:end]==1) >= 5:
+                clustering_models.append(logit_with_cv(seed, repeat_times, X_train_selected.iloc[start:end, :], diff_list[start:end], clustering=True, best_C = best_C))
+                models.append(model)
+            else:
+                clustering_models.append(None)
+                models.append(None)
+            cluster_ii += 1
+
+        Y_test_hats = []
+        Y_test_cluster_hats = []
+        columns = []
+        for cl, ccc in zip(*cluster_count):
+            X_test_cluster = X_test_selected.ix[cluster_test_label == cl, :]
+            Y_test_cluster = Y_test.ix[ cluster_test_label == cl, diff_i ]
+            if (Y_test_cluster.sum()>=2) and (models[cl] != None) and (clustering_models[cl] != None):
+                Y_test_cluster_hat = models[cl].predict_log_proba(X_test_cluster)[:, 1]
+                Y_test_hats.append(Y_test_cluster_hat)
+
+                Y_test_cluster_model_hat = clustering_models[cl].predict_log_proba(X_test_cluster)[:, 1]
+                Y_test_cluster_hats.append(Y_test_cluster_model_hat)
+                columns.append('cluster with overall model %s differential gene ratio %s' % (cl, sum(Y_test_cluster==1)/(1.0 * sum(cluster_test_label==cl))))
+                fpr, tpr, thresholds = metrics.roc_curve(Y_test_cluster, Y_test_cluster_hat, pos_label=1)
+                fprs.append(fpr)
+                tprs.append(tpr)
+                aucs.append("cluster with overall model %s gene number %s %s AUC:" % (cl, ccc, sum(cluster_test_label==cl)) + str(metrics.auc(fpr, tpr)))
+                fpr, tpr, thresholds = metrics.roc_curve(Y_test_cluster, Y_test_cluster_model_hat, pos_label=1)
+                fprs.append(fpr)
+                tprs.append(tpr)
+                aucs.append("cluster model %s gene number %s %s AUC:" % (cl, ccc, sum(cluster_test_label==cl)) + str(metrics.auc(fpr, tpr)))
+
+        # plt.figure()
+        # n= 0
+        # for i, j in zip(Y_test_hats, columns):
+        #     n+=1
+        #     # plt.hist(i, bins=50, label=j)
+        #     ax = sns.distplot(i, kde_kws={"lw": 3, "label": j,'color': cols[n]}, hist_kws={'color': cols[n], "alpha":0.4})
+        # plt.legend()
+        # plt.savefig(os.path.join('../figure/', Y_test.columns[diff_i] + '_hist_diff_density.pdf'))
+
+        cluster_coefs = []
+
+        for m in clustering_models:
+            if m:
+                cluster_coefs.append(m.coef_)
+            else:
+                cluster_coefs.append(np.array(0))
+
+        # pw_coefs = []
+        # columns = []
+        # for index, cc in enumerate(cluster_coefs):
+        #     if cc.any():
+        #         pw_coefs.append(cc.reshape(-1,1))
+        #         columns.append('cluster %s' % index)
+
+        # from scipy.stats import pearsonr
+        # from pandas.tools.plotting import scatter_matrix
+        # if pw_coefs:
+        #     cluster_coefs_df = pd.DataFrame(np.hstack(pw_coefs), columns=columns)
+        #     plt.figure()
+        #     scatter_matrix(cluster_coefs_df, alpha=0.8, figsize=(6, 6), diagonal='kde')
+        #     plt.savefig(os.path.join('../figure/', Y_test.columns[diff_i] + '_pairwise_coef.png'))
+
+        plt.close('all')
+        fig = plt.figure()
+        fig.set_size_inches((9, 4))
+        plt.clf()
+        i = 0
+        for f, t, a in zip(fprs, tprs, aucs):
+            plt.plot(f, t, color=cols[i], label=a)
+            i += 1
+        plt.xlabel('False positive rate')
+        plt.ylabel('True positive rate')
+        plt.legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc=2, borderaxespad=0.)
+        plt.subplots_adjust(left=0.09, bottom=0.1, right=0.5, top=0.9, wspace=0.03, hspace=0.03)
+        plt.title(Y.columns[diff_i])
+        plt.savefig(os.path.join('../figs/', Y_test.columns[diff_i] + '_roc.pdf'))
+
+        # NOTE!!!: do not transform for heatmap visualization
+        fs_rp = X_train_selected
+
+        cmap = plt.cm.get_cmap('RdBu_r')
+        plt.close('all')
+        fig = plt.figure()
+        fig.set_size_inches(20, 6)
+        ax = plt.subplot2grid((14,14), (0,0), rowspan=8, colspan=11)
+        fs_rp = fs_rp.T
+        dx, dy = 4, 4
+        y, x = np.mgrid[slice(-fs_rp.shape[0]*2, fs_rp.shape[0]*2 + dy, dy),
+                        slice(-fs_rp.shape[1]*2, fs_rp.shape[1]*2 + dx, dx)]
+        ax.set_title('RP for l1 selected %s samples against %s differential list' % (len(features), Y.columns[diff_i]), fontweight='bold', fontsize=15)
+        ra = max(abs(fs_rp.values.min()), abs(fs_rp.values.max()))
+        # keep the original colors
+        heatmap = plt.pcolormesh(x, y, fs_rp.values, cmap=cmap,
+                                 vmin=-ra,
+                                 vmax=ra)
+        ax.set_frame_on(False)
+        ax.set_yticks(y[:, 0]+dy/2, minor=False)
+        ax.set_xticks(x[0]+dx/2, minor=False)
+
+        # ax.set_xticklabels(labels, minor=False)
+        ax.set_xticklabels([], minor=False)
+        ax.set_yticklabels([], minor=False)
+        axr = plt.axis([x.min(), x.max(), y.min(), y.max()])
+        # ax.invert_yaxis()
+        # ax.xaxis.tick_top()
+        # plt.xticks(rotation=90)
+        ax.grid(False)
+        for t in ax.xaxis.get_major_ticks():
+            t.tick1On = False
+            t.tick2On = False
+        for t in ax.yaxis.get_major_ticks():
+            t.tick1On = False
+            t.tick2On = False
+
+        # label the gene clusters on the right panel
+        ax = plt.subplot2grid((14,14), (0,11), rowspan=8, colspan=3)
+        plt.axis([0, 15, axr[2], axr[3]])
+        plt.axis('off')
+        dx = 4
+        xc, yc = np.mgrid[slice(1.5, 2.1, 0.5),
+                          slice(-fs_rp.shape[0]*2, fs_rp.shape[0]*2 + dx, dx)]
+
+        # symmetric scale by divides the maximum value of absolute coef.min and coef.max
+        scale = max(abs(coefs.min()), abs(coefs.max()))
+        coefs = coefs/(1.0*scale)
+        coefs = coefs.reshape(1, -1)
+
+        ra = max(abs(coefs.min()), abs(coefs.max()))
+
+        coef_heatmap = plt.pcolormesh(xc, yc, coefs, cmap=cmap,
+                                      vmin=-1,
+                                      vmax=1)
+        plt.colorbar(coef_heatmap, orientation='vertical', ax=ax)
+
+        for index, ccs in enumerate(cluster_coefs):
+            if ccs.any():
+                scale = max(abs(ccs.min()), abs(ccs.max()))
+                ccs = ccs/(1.0*scale)
+                ccs = ccs.reshape(1, -1)
+                coef_heatmap = plt.pcolormesh(xc+2*(index+1), yc, ccs, cmap=cmap,
+                                              vmin=-ra,
+                                              vmax=ra)
+                ax.set_xticks([xc[0].mean()], minor=False)
+                ax.set_xticklabels(['cluster %s' % index], minor=False)
+ 
+        cols = list(sns.xkcd_palette(colors))
+        shapes = []; start = 0
+
+        for index, f in enumerate(factors):
+            if index == 0:
+                end = start + feature_count[f]
+            else:
+                start = end
+                end = start + feature_count[f]
+
+            shape = p.Rectangle((0, y[start, 0]), 0.5, y[end, 0]-y[start,0], color=cols[index], label=f)
+            shapes.append(shape)
+            ax.add_patch(shape)
+            if end - start >= 2: # label the two clusters within a factor
+                # cluster_0_index, = np.where(clustering_factor_labels[index]==0)
+                cluster_1_index, = np.where(clustering_factor_labels[index]==1)
+                shape = p.Rectangle((0.8, y[start, 0]), 0.5, y[start+cluster_1_index[0], 0]-y[start,0], color="0.5", label=f)
+                ax.add_patch(shape)
+                shape = p.Rectangle((0.8, y[start+cluster_1_index[0], 0]), 0.5, y[end,0]-y[start+cluster_1_index[0], 0], color="0.85", label=f)
+                ax.add_patch(shape)
+            else: # only one sample in a factor
+                shape = p.Rectangle((0.8, y[start,  0]), 0.5, dy, color="0.2", label=f)
+                ax.add_patch(shape)                
+
+        ax = plt.subplot2grid((14,14), (8,0), rowspan=6, colspan=11)
+        plt.axis([axr[0], axr[1], -8, 15])
+        plt.axis('off')
+
+        diff_poss, = np.where(diff_list.values==1)
+        diff_label = p.Rectangle((x[0, 0], y[0, 0]-dy),
+                                 dx, float(dy)*2/3, color="k", label='diff gene')
+        # label differential gene
+        for diff_pos in list(diff_poss):
+            diff_label = p.Rectangle((x[0, diff_pos], 12),
+                                     dx/3, 2.4, color="#7e1e9c", label='diff gene') # narrow the diff label width
+            ax.add_patch(diff_label)
+
+        cluster_labels_legend = []
+        cluster_legends = []
+        n = 0
+        for label, count in zip(*cluster_count):
+            cluster_pos, = np.where(cluster_labels == label)
+            if n%2==0:
+                shift = 1.9
+            else:
+                shift = -0.5
+            n += 1
+            plt.text((x[0, cluster_pos[-1]]+x[0, cluster_pos[0]])/2, 8.6+shift,
+                     str(round(float(sum(diff_list[cluster_pos]))/len(cluster_pos), 4)) + ' ; ' + str(sum(diff_list[cluster_pos])), fontsize=9, fontweight='bold', horizontalalignment='center')
+            cluster_label = p.Rectangle((x[0, cluster_pos[0]], 9.0),
+                                        x[0, cluster_pos[-1]]-x[0, cluster_pos[0]], 2.8, color=cols[label], label='%s cluster' %(label))
+            cluster_legends.append('%s cluster' % (label))
+            cluster_labels_legend.append(cluster_label)
+            ax.add_patch(cluster_label)
+        plt.legend(handles=[diff_label] + shapes + cluster_labels_legend, labels=['diff']+factors+cluster_legends, loc=3, bbox_to_anchor=(0., 0.00, 1., 0.12), mode='expand', ncol=5, frameon=False, fontsize=10)
+        plt.colorbar(heatmap, ax=ax, shrink=.8, orientation='horizontal')
+        plt.subplots_adjust(left=0.03, bottom=0.08, right=0.92, top=0.95, wspace=0.03, hspace=0.03)
+        fig.savefig(os.path.join('../figs/', Y_test.columns[diff_i] + '.png'), dpi=100)
+
+
+def logit_predict(seed, repeat_times,
+                  X_test, Y_test, X_train, Y_train,
+                  C=0.1, calibration=True):
+    """
+    Use logistic l1 penalty regression 3-fold cross validation to get the best C and predict by using the best
+    cross validation model
+    :param seed:
+    :param features_list: a 2d numpy array to select MultiIndex from pandas DataFrame
+    :param features_num: a list of [factors sample numbers each]
+    :param X_test: test gene set X
+    :param Y_test: test gene set Y
+    :param X_train: training gene set X
+    :param Y_train: training gene set Y
+    :param C: initial C for training model
+    :return: AUC from best cross validation model, and get back the corresponding train/validation set
+    """
+    LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01,
+                                            n_jobs=8, dual=False, random_state=seed)
+    parameters = {'C': [C, 0.0001, 0.01, 0.03, 1, 3]}
+
+    gs = GridSearchCV(LR_l1, parameters, cv=3, n_jobs=9, scoring="roc_auc")
+    gs.fit(X_train, Y_train)
+    if not calibration:
+        # use the best model in the cross valiation with
+        # the best split and best parameters set
+        return metrics.roc_auc_score(Y_test, gs.predict_log_proba(X_test)[:, 1]), gs.best_estimator_.coef_
+    else:
+        # train again with the best parameters set with all training gene set
+        aucs = np.zeros((repeat_times, ))
+        ps = np.zeros((repeat_times, ))
+        models = []
+        for t in range(repeat_times):
+            LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C = gs.best_params_['C'],
+                                                    n_jobs=8, dual=False, random_state=seed)
+            LR_l1.fit(X_train, Y_train)
+            models.append(LR_l1)
+            aucs[t] = metrics.roc_auc_score(Y_train, LR_l1.predict_log_proba(X_train)[:, 1])
+            ps[t] = metrics.average_precision_score(Y_train, LR_l1.predict_log_proba(X_train)[:, 1])
+        best_auc_index = np.argmax(aucs)
+        best_ps_index = np.argmax(ps)
+        test_auc = metrics.roc_auc_score(Y_test, models[best_auc_index].predict_log_proba(X_test)[:, 1])
+        test_pr = metrics.average_precision_score(Y_test, models[best_ps_index].predict_log_proba(X_test)[:, 1])
+        print(test_auc, test_pr)
+        return test_auc, models[best_auc_index].coef_
+
+
+def logit_predict_tfbs(seed, repeat_times, X, Y, output, factor, C=0.1):
+    """
+    Use logistic l1 penalty regression 3-fold cross validation to get the best C and predict by using the best
+    cross validation model
+    :param seed:
+    :param X: training gene set X
+    :param Y: training gene set Y
+    :param C: initial C for training model
+    :return: AUC from best cross validation parameters, and get back the corresponding model
+    """
+    LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01,
+                                            n_jobs=8, dual=False, random_state=seed)
+    parameters = {'C': [C, 0.0001, 0.01, 0.03, 1, 3]}
+
+    gs = GridSearchCV(LR_l1, parameters, cv=3, n_jobs=9, scoring="roc_auc")
+    gs.fit(X, Y)
+    # train again with the best parameters set with all training gene set
+    aucs = np.zeros((repeat_times, ))
+    ps = np.zeros((repeat_times, ))
+    models = []
+    for t in range(repeat_times):
+        LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C = gs.best_params_['C'],
+                                                n_jobs=8, dual=False, random_state=seed)
+        LR_l1.fit(X, Y)
+        models.append(LR_l1)
+        aucs[t] = metrics.roc_auc_score(Y, LR_l1.predict_log_proba(X)[:, 1])
+        ps[t] = metrics.average_precision_score(Y, LR_l1.predict_log_proba(X)[:, 1])
+    best_auc_index = np.argmax(aucs)
+    best_ps_index = np.argmax(ps)
+    with open(os.path.join(output, '%s_logit_model.pkl' % factor), 'wb') as outf:
+        pickle.dump({'ids': X.columns, 'AUC':models[best_auc_index], 'PR': models[best_ps_index]}, outf)
+
+    return aucs[best_auc_index], ps[best_ps_index], models[best_auc_index], models[best_ps_index]
+
+
+def l1_feature_exploration(seed, x_train, y_train, x_test, y_test):
+    """
+    type: pandas DataFrame
+    x_train, y_train: training gene set for x and y
+    x_test, y_test: testing gene set for x and y
+    """
+    N = 10; n = 0; diff_count = 0
+    # loop through N differential gene lists
+    thresholds = [0.001, 0.005, 0.01, 0.05, 0.1, 0.3]
+    seeds = range(seed, seed+10)
+    differential_gene_list, thresholds_list = [], []
+    factors, ratios = [], []
+
+    for i in np.arange(y_train.shape[1]):
+        print(y_train.columns[i])
+        diff_count += 1
+        for s in seeds:
+            LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01,
+                                                    n_jobs=5, dual=False, random_state=s)
+            fs = SelectFromModel(LR_l1, threshold=1e-4, prefit=False)
+            fs.fit(x_train.values, y_train.iloc[:,i].values)
+            for t in thresholds:
+                n += 1
+                fs.threshold = t
+                features = fs.transform(np.arange(x_train.values.shape[1]).reshape(1,-1))
+                features = x_train.columns.get_level_values(0)[features]
+                result = np.unique(features, return_counts=True)
+                ratio = result[1]/(result[1].sum()*1.0)
+
+                # append feature proportion from one differential gene list
+                # and one threshold, one randome seed
+                for index, r in enumerate(result[0]):
+                    factors.append(r)
+                    ratios.append(ratio[index])
+                    differential_gene_list.append(y_train.columns[i])
+                    thresholds_list.append(t)
+        if diff_count >= N:
+            break
+
+    df = pd.DataFrame({'Differential_gene_list': differential_gene_list, 'L1_penalty_thresholds': thresholds_list,
+                       'Factors': factors, 'Features_proportion': ratios})
+    # fi = 411 # 6 thresholds
+    # sns.set_style('white')
+    # sns.set_context("notebook", font_scale=1.1)
+    # fig = plt.figure(figsize=(len(thresholds_list), N*3))
+    with sns.axes_style('white'):
+        for index, t in enumerate(y_train.columns[:N]):
+            plt.close('all')
+            plt.clf()
+            fig = plt.figure(figsize=(8.5, 5))
+            # ax = fig.add_subplot(fi)
+            ax = fig.add_subplot(111)
+            # fi += 1
+            dff = df.ix[df.Differential_gene_list==t, :]
+            ax = sns.barplot(x='Factors', y='Features_proportion', hue='L1_penalty_thresholds', palette='Paired', data=dff, ci=0.95, linewidth=1.2)
+            sns.plt.ylim([0, 0.7])
+            # if index==0:
+            legend = sns.plt.legend(loc=2, bbox_to_anchor=(0.95, 1), borderaxespad=0.0)
+
+            plt.title(t, fontsize=12, fontweight='bold', y=1.1)
+            # else:
+            #     ax.legend_.remove()
+            # if index != len(thresholds)-1:
+            #     ax.set_xticklabels([], minor=False)
+            # else:
+            sns.plt.xticks(rotation=45, ha='right', fontsize=7, fontweight='bold')
+            sns.plt.xlabel('')
+            sns.plt.ylabel('Sample features proportion')
+            sns.despine()
+            # plt.tight_layout(w_pad=1.0, h_pad=1.0)
+            fig.subplots_adjust(left=0.2, right=0.7, top=0.85, bottom=0.15, wspace=0.05, hspace=0.1)
+            plt.savefig('marge_features_l1_%s.pdf' % t)
+
+def select_features(seed, x_train, y_train, rounds, maxsamples=12, C=0.1, features=[]):
+    """ use all genes with regulatorization to select top samples
+
+    :param seed: global random seed
+    :param x: predictor, such as H3K4me3 regulatory potential pandas DataFrame
+    :param y: response, such as E2 stimuli differential gene list pandas Series
+    :param factor: factor name, such as H3K4me3
+    :param maxsamples: maximum samples selected in the feature selection
+    :return: selected samples index for a given factor
+
+    """
+    features_lists = []
+    features_num = []
+    #for factor in x_train.columns.levels[0]:
+    for factor in features:
+        features_list = []
+        x_train_factor = x_train[factor]
+        for fs_freq in range(rounds):
+            seed_inner = seed + fs_freq * 3
+            # feature selection of top maxsamples by feature importance (weights)
+            # by using SelectFromModel's threshold with logistic l1 penalty
+            # remaining issue:
+            # hard to determine the threshold increase amount
+            # to get exact `maxsamples` features, reserve for reference
+            # solution: sort absolute coef_ to get the top `maxsamples` features
+
+            ## use 5-fold cross validation to choose the best parameters of lambda
+            LR_l1 = linear_model.LogisticRegression(C=C, penalty='l1', tol=0.01,
+                                                    n_jobs=5, dual=False, random_state=seed_inner)
+            fs = SelectFromModel(LR_l1, threshold=1e-5, prefit=False)
+            fs.fit(x_train_factor, y_train)
+            top_features_index = np.argsort(np.abs(fs.estimator_.coef_).flatten())[::-1][:maxsamples]
+            assert len(top_features_index) == maxsamples
+
+            x_multi_index = np.asarray(zip([factor] * maxsamples, x_train_factor.columns[top_features_index]))
+            x_train_factor = x_train_factor.drop(x_train_factor.columns[top_features_index], axis=1, inplace=False)
+
+            features_list.append(x_multi_index)
+        features_list = np.vstack(features_list)
+        features_num.append(features_list.shape[0])
+        features_lists.append(features_list)
+
+    return features_num, np.vstack(features_lists)
+
+
+def split_gene(sym, seed, bychrom=False):
+    """
+    splitting all genes into gene sets from odd and even chromosomes
+    :param sym: pandas DataFrame index, e.g. chr1:start:end:refseq:symbol
+    :return: training gene index, test gene index
+    """
+    if bychrom:
+        train_chroms = ['chr1', 'chr3', 'chr5', 'chr7', 'chr9', 'chr11', 'chr13', 'chr15', 'chr17', 'chr19', 'chr21', 'chrX', 'chrY']
+        test_chroms = ['chr2', 'chr4', 'chr6', 'chr8', 'chr10', 'chr12', 'chr14', 'chr16', 'chr18', 'chr20', 'chr22']
+        train_index = []
+        test_index = []
+
+        for i, g in enumerate(list(sym)):
+            g = g.split(':')
+            if g[0] in train_chroms:
+                train_index.append(i)
+            if g[0] in test_chroms:
+                test_index.append(i)
+        print(len(train_index))
+        print(len(test_index))
+    else:
+        l = len(list(sym))
+        all_index = np.arange(l)
+        rng = np.random.RandomState(seed)
+        train_index = rng.choice(all_index, int(l*0.8), replace=False)
+        test_index = np.delete(all_index, train_index)
+        print l
+        print train_index.shape
+        print test_index.shape
+
+    return (train_index, test_index)
+
+
+def read_pandas(df):
+    """
+
+    :param df: pandas DataFrame pickle file path
+    :return: pandas DataFrame
+    """
+    return pd.read_pickle(df)
+
+
+def normalize_rp(df, sqrt=True, return_median = False):
+    """
+    input .pkl file as pandas DataFrame and pre-process it
+    by adding pseudo-count, take log 2 and subtracting median
+
+    :param df: pandas DataFrame with index instead of multi-index
+    :return: (normalized) pandas DataFrame
+    """
+    if sqrt:
+        df = np.sqrt(df)
+    else:
+        df = np.log2(df+1)
+    if not return_median:
+        return df - df.median(0)
+    else:
+        med = df.median(0)
+        if hasattr(df, 'values'):
+            return med.values, df - med
+        else:
+            return med, df - med
+
+def adaboostSKlearn(X_train, Y_train, X_test, Y_test, seed=999):
+    """ 1st method by using sklearn
+    1. traditional ways, first feature selection with l1 penalty, then take all selected
+features for adaboost training (with neural network, logistic regression and svm) in training set with cross validation to choose parameters,
+then training with all training set then testing in an independent set
+    """
+    LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=0.1,
+                                            class_weight='balanced',
+                                            n_jobs=5, dual=False, random_state=seed)
+    fs = SelectFromModel(LR_l1, threshold=0.3)
+    ada = AdaBoostClassifier(random_state=seed)
+    for i in Y_train.columns:
+        fs.fit(X_train.values, Y_train[i].values)
+        index = fs.transform(np.arange(X_train.shape[1]).reshape(1, -1))[0]
+        print(index)
+        ada.fit(X_train.iloc[:, index].values, Y_train[i].values)
+        Y_hat = ada.predict_log_proba(X_test.iloc[:, index].values)
+        auc = metrics.roc_auc_score(Y_test[i].values, Y_hat[:, 1])
+        print(i)
+        print(auc)
+
+
+def logit_with_cv(seed, repeat_times, X_train, Y_train, clustering=False, best_C=1, group=False):
+    """
+    seed : random seed
+    repeat_times: train with train gene set with best parameters times
+    """
+    print(X_train.shape, Y_train.shape)
+    LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C = best_C, n_jobs=8, dual=False, random_state=seed)
+
+    if clustering:
+        train_AUCs = np.zeros((repeat_times,))
+        models = []
+        for t in range(repeat_times):
+            models.append(LR_l1.fit(X_train.values, Y_train.values))
+            Y_train_hat = models[t].predict_log_proba(X_train.values)
+            train_AUCs[t] = metrics.roc_auc_score(Y_train.values, Y_train_hat[:, 1])
+        return models[np.argmax(train_AUCs)]
+
+    fs = SelectFromModel(LR_l1, prefit=False)
+    feature_model = Pipeline([
+        ('fs', fs),
+        ('clf', LR_l1)])
+    params = {
+        'fs__threshold': [0.01],
+        'clf__C': [0.1]
+    }
+    # cross validation to find the best parameters set
+    gs = GridSearchCV(feature_model, params, n_jobs=10, cv=5, scoring='roc_auc')
+    try:
+        gs.fit(X_train.values, Y_train.values)
+    except:
+        Y_train = Y_train.iloc[:,0]
+        gs.fit(X_train.values, Y_train.values)
+
+    # use all train set with the best parameters set
+    train_AUCs = np.zeros((repeat_times,))
+    models = []
+    
+    for t in range(repeat_times):
+        LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C = gs.best_params_.get('fs__estimator__C', 1),
+                                                dual=False, random_state=seed+t)
+        fs = SelectFromModel(LR_l1, threshold=gs.best_params_.get('fs__threshold', 0.1), prefit=False)
+        LR_l1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C = gs.best_params_.get('clf__C', 1),
+                                                dual=False, random_state=seed+t)
+        model = Pipeline([
+            ('fs', fs),
+            ('clf', LR_l1)])
+        model.fit(X_train.values, Y_train.values)
+        models.append(model)
+        Y_train_hat = model.predict_log_proba(X_train.values)
+        train_AUCs[t] = metrics.roc_auc_score(Y_train.values, Y_train_hat[:, 1])
+
+    # the best model and cross validation for the best parameters
+    best_C = gs.best_params_.get('clf__C', 1)
+    return models[np.argmax(train_AUCs)], best_C
+
+
+def train_nn(seed, repeat_times, args, X, Y):
+    """
+    focus on prediction of differential gene list
+    feature selection through l1 logsitic penalty
+    split genes into train/validation/test, test on test genes
+
+    :param seed: random seed
+    :param repeat_times: repeat times of training models
+    :param args: argument list
+    :param X: pandas DataFrame
+    :param Y: pandas DataFrame
+    :return:
+    """
+
+    maxsamples = 10
+    X = normalize_rp(X.loc[Y.index, :], sqrt=False)
+
+    # X = trim(X)
+    # sigmoid
+    # X = 1 / (1+np.exp(-X))
+    assert (X.index == Y.index).all()
+
+    train_index, test_index = split_gene(X.index, seed, False)
+    factors = list(X.columns.levels[0])
+    X_train = X.iloc[train_index, :]
+    Y_train = Y.iloc[train_index, :]
+    X_test = X.iloc[test_index, :]
+    Y_test = Y.iloc[test_index, :]
+
+    for diff_i in np.arange(Y.shape[1]):
+        print(Y.columns[diff_i])
+        if not os.path.isdir(args.output):
+            os.mkdir(args.output)
+
+        output = os.path.join(args.output, '%s__calibration_performance_%s.pkl' % (Y.columns[diff_i], maxsamples))
+        if not os.path.exists(output):
+            nn_marge_result = pd.DataFrame(np.zeros((1, 2)),
+                                           columns=['ComboLogisticL1',
+                                                    'ComboSparseNeuralNetwork_%d_Hidden_samplenum_%d' % (int(args.hidden)*len(factors), repeat_times*int(maxsamples)*len(factors))])
+            # logistic feature selection
+            features_num, features_list = select_features(seed, X_train, Y_train.iloc[:, diff_i],
+                                                          repeat_times, maxsamples=maxsamples)
+            # logistic regression with cross valiation parameters adjusting
+            nn_marge_result.iloc[0, 0], logit_coef = logit_predict(seed, repeat_times,
+                                                                   X_test[features_list], Y_test.iloc[:, diff_i],
+                                                                   X_train[features_list], Y_train.iloc[:, diff_i], calibration=True)
+            print(nn_marge_result)
+            # use 3 split to compare with sklearn 3-fold cross validation
+            test_auc = run_mlp(seed,
+                               X_test[features_list], Y_test.iloc[:, diff_i],
+                               X_train[features_list], Y_train.iloc[:, diff_i],
+                               features_num, repeat_times, Y.columns[diff_i],
+                               sparse_connect=args.sparse,
+                               # pre_training=logit_coef, # obsoleted logistic coef insertion
+                               sparse_group=len(factors))
+            nn_marge_result.iloc[0, 1] = test_auc
+            print(nn_marge_result)
+            nn_marge_result.to_pickle(output)
+
+
+
+def train_nn_tfbs(seed, repeat_times, args, X, Y, features, output, factor):
+    """
+    focus on prediction of TF binding sites
+    samples feature selection through l1 logistic penalty
+    split genes into train/validation,
+
+    :param seed: random seed
+    :param repeat_times: repeat times of training models
+    :param args: argument list
+    :param X: pandas DataFrame
+    :param Y: pandas DataFrame
+    :return:
+    """
+    print('_'.join(features))
+    fout = open(os.path.join(output, factor + '_' + '_'.join(list(features))), 'w')
+    maxsamples = 15
+    # full connected neural network
+    X_orig = X.loc[Y.index, :].copy()
+    med, X = normalize_rp(X.loc[Y.index, :], sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+
+    X = X.subtract(gene_mean, axis='index')
+
+    assert (X.index == Y.index).all()
+
+    features_num = []
+
+    for diff_i in np.arange(Y.shape[1]):
+        print(Y.columns[diff_i])
+        if not os.path.isdir(args.output):
+            os.mkdir(args.output)
+
+        output = os.path.join(args.output, '%s__calibration_performance_%s.txt' % (Y.columns[diff_i], maxsamples))
+
+        if not os.path.exists(output):
+            fac = Y.columns[diff_i]
+            if args.sparse:
+                # need to align the sample number
+                features_num, features_list = select_features(seed, X, Y.iloc[:, diff_i],
+                                                              repeat_times, maxsamples=maxsamples, features=features)
+
+                X_selected = X[features_list]
+
+                # logistic regression with cross valiation parameters adjusting
+
+                auc, pr, model_auc, model_ps = logit_predict_tfbs(seed, repeat_times,
+                                                                  X_selected, Y.iloc[:, diff_i],
+                                                                  args.output, fac)
+                print(auc, pr)
+            else:
+                C = np.arange(0.0001, 0.1, 0.0001)
+
+                high = len(C)-1
+                low = 0
+                while (low <= high):
+                    mid = (low + high) / 2
+                    L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid],
+                                                         n_jobs=5,
+                                                         dual=False, random_state=seed)
+                    L1.fit(X.values, Y.iloc[:, 0].values)
+                    coef, = L1.coef_
+                    coef_index, = np.where(coef != 0)
+                    if len(coef_index) > 80:
+                        # too many samples, prefer stronger regularization, lower C
+                        high = mid - 1
+                    elif len(coef_index) < 40:
+                        low = mid + 1
+                    else:
+                        break
+                    print(len(coef_index), low, high)
+
+                X = X_orig.iloc[:, coef_index].copy()
+                del X_orig
+
+                print(X.shape)
+                med, X = normalize_rp(X, sqrt=False, return_median=True)
+                gene_mean = X.mean(1)
+
+                X = X.subtract(gene_mean, axis='index')
+
+            factors = X.columns.get_level_values(0)
+            ids = X.columns.get_level_values(1)
+
+            idmap = {}; n = 0; maps = {}
+            for i, f in zip(ids, factors):
+                idmap[i] = n
+                maps[f] = maps.get(f, [i]) + [i]
+                n += 1
+
+            # hard code data directory
+            with h5py.File(glob.glob(os.path.expanduser("~/12_data/MARGE/*%s*h5" % f))[0], 'r') as store:
+                dset = store[maps[f][0]][...]
+
+            d = np.empty(shape=(len(dset), len(factors)), dtype=np.float32)
+            d[:, idmap[maps[f][0]]] = dset
+
+            for f in maps:
+                for i in maps[f]:
+                    with h5py.File(glob.glob(os.path.expanduser("~/12_data/MARGE/*%s*h5" % f))[0], 'r') as store:
+                        dset = store[str(i)][...]
+                    d[:, idmap[i]] = dset
+
+            factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+            with h5py.File(os.path.expanduser('~/12_data/MARGE/hg38_UDHS_TF_intersect.h5'), 'r') as store:
+                index = np.asarray(store[factor[fac]][...], dtype=np.int32)
+
+            # TF binding position
+            TF = np.zeros(d.shape[0])
+            TF[index-1] = 1
+
+            # use 3 split to compare with sklearn 3-fold cross validation
+            print(d.shape)
+            print(TF.shape)
+
+            d = np.log2(d + 1)
+            d = d - np.median(d, axis=0)
+
+            test_auc = run_mlp(seed,
+                               d, TF,
+                               X, Y.iloc[:, 0],
+                               features_num, repeat_times, Y.columns[diff_i],
+                               sparse_connect=args.sparse,
+                               # pre_training=logit_coef, # obsoleted logistic coef insertion
+                               sparse_group=len(features_num))
+            print >>fout, test_auc
+            fout.close()
+
+def samplesNumberEffectWithDeltaRP(factormap, TF_h5, uDHS, cis, seed, repeat_times,
+                        X, Y, output, fac, feats, logit_delta_model=True,
+                        delta_model = True, cluster = True):
+    X_orig = X.loc[Y.index, :].copy()
+    print('_'.join(feats))
+    med, X = normalize_rp(X.loc[Y.index, :], sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+    X = X.subtract(gene_mean, axis='index')
+
+
+    cis_dict = OrderedDict()
+    chrom_cis = []
+    mid_cis = []
+    i = 0
+    # uDHS is already sorted and union
+    with open(uDHS) as inf:
+        for line in inf:
+            line = line.strip().split()
+            chrom_cis.append(line[0])
+
+            mid = (int(line[1])+int(line[2]))//2
+            mid_cis.append(mid)
+
+            if cis_dict.has_key(line[0]):
+                cis_dict[line[0]][0].append(mid)
+                cis_dict[line[0]][1].append(i)
+            else:
+                # 0: position, 1: index
+                cis_dict[line[0]] = [[mid], [i]]
+            i += 1
+
+    for key in cis_dict:
+        cis_dict[key][0] = np.array(cis_dict[key][0])
+        cis_dict[key][1] = np.array(cis_dict[key][1], dtype=np.int32)
+        cis_dict[key].append(len(cis_dict[key][0]))
+
+    chrom_cis = np.array(chrom_cis)
+    mid_cis = np.array(mid_cis, dtype=np.int32)
+
+    BW = 1e5
+    chrom_tss = Y.index.map(lambda x: x.split(':')[0])
+    start_tss = Y.index.map(lambda x: int(x.split(':')[1]))
+
+    for sampleN in range(2, 300, 1):
+        # if os.path.exists(os.path.join(output, fac + '_' + '_'.join(list(feats)) + '.limitsamplesN_%s'%sampleN)):
+        #     continue
+
+        fout = open(os.path.join(output, fac + '_' + '_'.join(list(feats)) + '.limitsamplesN_%s'%sampleN), 'w')
+        C = np.arange(0.000001, 1, 0.000001)
+        high = len(C)-1
+        low = 0
+        while (low <= high):
+            mid = (low + high) / 2
+            L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid],
+                                                 n_jobs=5,
+                                                 dual=False, random_state=seed)
+            L1.fit(X.values, Y.iloc[:, 0].values)
+            coef, = L1.coef_
+            coef_index, = np.where(coef != 0)
+            if len(coef_index) > sampleN:
+                # too many samples, prefer stronger regularization, lower C
+                high = mid - 1
+            elif len(coef_index) < sampleN:
+                low = mid + 1
+            else:
+                break
+
+        X2 = X_orig.iloc[:, coef_index].copy()
+        X2_orig = X2.copy()
+
+        med, X2 = normalize_rp(X2, sqrt=False, return_median=True)
+        gene_mean = X2.mean(1)
+        X2 = X2.subtract(gene_mean, axis='index')
+        k = 7
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+                                             n_jobs=10,
+                                             dual=False, random_state=seed)
+        Cs = []
+        i = 1000.0
+        while i >= 0.001:
+            Cs.append(i)
+            i /= 3
+        gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+        gs.fit(X2.values, Y.iloc[:, 0].values)
+
+        print('get parameters...')
+
+        coefs = []
+        aucs = []
+        for i in range(repeat_times):
+            L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=gs.best_params_.get('C', 1),
+                                                 n_jobs=10,
+                                                 dual=False, random_state=seed)
+            L1.fit(X2.values, Y.iloc[:, 0].values)
+            aucs.append(metrics.roc_auc_score(Y.iloc[:, 0].values, L1.predict_log_proba(X2.values)[:,1]))
+            coefs.append(L1.coef_)
+
+        print(max(aucs))
+        A, = coefs[np.argmax(aucs)]
+
+        features = X2.columns.get_level_values(0)
+        factors = X2.columns.get_level_values(0)
+        ids = X2.columns.get_level_values(1)
+
+        print >>fout, '\t'.join(list(ids))
+        print >>fout, '\t'.join(map(str, list(A)))
+
+        idmap = {}; n = 0; maps = {}
+        for i, f in zip(ids, factors):
+            idmap[i] = n
+            maps[f] = maps.get(f, [i]) + [i]
+            n += 1
+
+        with h5py.File(factormap[f], 'r') as store:
+            dset = store[maps[f][0]][...]
+
+        d = np.empty(shape=(len(dset), len(factors)), dtype=np.float32)
+        d[:, idmap[maps[f][0]]] = dset
+
+        n = 0
+        for f in maps:
+            for i in maps[f]:
+                with h5py.File(factormap[f], 'r') as store:
+                    dset = store[str(i)][...]
+                n += 1
+                d[:, idmap[i]] = dset
+
+        factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+        with h5py.File(TF_h5, 'r') as store:
+            index = np.asarray(store[factor[fac]][...], dtype=np.int32)
+
+        # TF binding position
+        TF = np.zeros(d.shape[0])
+        TF[index-1] = 1
+
+        cis_delta_RP_max = np.zeros( TF.shape[0] ) # d, for shifting of RP after deleting uDHS
+        cis_de_max = np.zeros( TF.shape[0] )       # d, for differential gene record
+
+        direct = np.dot(d, A)
+        print >>fout, 'directLogisticRegression\tAUC\t' + str(metrics.roc_auc_score(TF, direct))
+        print >>fout, 'directLogisticRegression\tPR\t' + str(metrics.average_precision_score(TF, direct))
+
+        # remove1kbTSS = False
+        # loop through all unique genes
+        for i in np.arange(Y.shape[0]):
+            chrom = chrom_tss[i]
+            start = start_tss[i]
+
+            # ordered binary search
+            if not cis_dict.has_key(chrom):
+                continue
+
+            if start-BW < 0:
+                left_margin = bisect_left(cis_dict[chrom][0], 0)
+            else:
+                left_margin = bisect_left(cis_dict[chrom][0], start-BW)
+
+            right_margin = bisect_right(cis_dict[chrom][0], start+BW)
+
+            # if remove1kbTSS:
+            #     if start < 1000:
+            #         left_margin1kb = bisect_left(cis_dict[chrom][0], 0)
+            #     else:
+            #         left_margin1kb = bisect_left(cis_dict[chrom][0], start-BW)
+            #     right_margin1kb = bisect_left(cis_dict[chrom][0], start+BW)
+
+            left_margin = cis_dict[chrom][1][left_margin]
+            # -1 in case out of the chromosome end
+            right_margin = cis_dict[chrom][1][right_margin-1]
+
+            n = right_margin - left_margin + 1
+            cisval = d[left_margin:(right_margin+1)]
+            cispos = mid_cis[left_margin:(right_margin+1)]
+
+            # get RP for the gene
+            # n_d x m
+            RP_new = rp_diff( X2_orig.values[i], cisval, cispos-start )
+            RP_new = np.log2(RP_new + 1)
+            # RP_new = np.sqrt( RP_new )
+            # n_d x m - m,
+            RP_new = RP_new - med
+            # n_d x m - 1
+            RP_new = RP_new - gene_mean[i]
+
+            # shift in rp on deletion of element for a gene
+            # expression logit prediction for a gene
+            # m, x m, => 1
+            rp_s0 = np.dot(A, X2.values[i])
+            # 1 - n_d x m * m, => 1 - n_d => n_d
+            # original prediction - subtracted prediction
+            dz    = rp_s0 - np.dot(RP_new, A)
+
+            # ordered version
+            cis_delta_RP_max[left_margin:(right_margin+1)] = np.fmax( cis_delta_RP_max[left_margin:(right_margin+1)], dz )
+
+            # whether the uDHS is within the range of 100kb of TSS
+            # all TSS or differential TSS, Y.iloc[i, 0] * or 1 *
+            cis_de_max[left_margin:(right_margin+1)]       = np.fmax( cis_de_max[left_margin:(right_margin+1)], Y.iloc[i, 0] * np.ones(n) )
+
+            # if remove1kbTSS:
+            #     cis_de_max[left_margin1kb:(right_margin1kb+1)] = 0
+
+        #with open(os.path.join(output, fac + '_' + '_'.join(list(feats))) + '_delta_RP.txt', 'w') as outf:
+        #    for i, elem in enumerate(cis_de_max):
+        #        print >>outf, '\t'.join(map(str, [chrom_cis[i], mid_cis[i]-73, mid_cis[i]+73, TF[i], cis_delta_RP_max[i]]))
+
+        de_index = cis_de_max == 1
+        delta_model_y = cis_delta_RP_max[de_index]
+        # delta_model_y = np.log2(delta_model_y + 1)
+
+        delta_model_x = d[de_index]
+        delta_model_x = np.log2(delta_model_x+1)
+        delta_model_x = delta_model_x - np.median(delta_model_x, axis=0)
+
+        if delta_model:
+            l = linear_model.LinearRegression()
+            l.fit(delta_model_x, delta_model_y)
+            TF_hat = l.predict(d)
+            auc, pr = plot_evaluation(TF, TF_hat, os.path.join(output, fac))
+            print >>fout, 'deltaRPlinearregression\tAUC\t' + str(auc)
+            print >>fout, 'deltaRPlinearregression\tPR\t' + str(pr)
+        print "done..."
+        fout.close()
+
+def transductLogit(factormap, TF_h5, uDHS, cis, seed, repeat_times,
+                   X, Y, output, fac, feats, logit_delta_model=True,
+                   delta_model = True, cluster = True):
+    sampleN = 62
+    X_orig = X.loc[Y.index, :].copy()
+    print('_'.join(feats))
+    med, X = normalize_rp(X.loc[Y.index, :], sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+    X = X.subtract(gene_mean, axis='index')
+
+    fout = open(os.path.join(output, fac + '_' + '_'.join(list(feats)) + '_transfer_%s'%sampleN), 'w')
+    C = np.arange(0.00001, 1, 0.00001)
+    high = len(C)-1
+    low = 0
+    while (low <= high):
+        mid = (low + high) / 2
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid],
+                                             n_jobs=5,
+                                             dual=False, random_state=seed)
+        L1.fit(X.values, Y.iloc[:, 0].values)
+        coef, = L1.coef_
+        coef_index, = np.where(coef != 0)
+        if len(coef_index) > sampleN:
+            # too many samples, prefer stronger regularization, lower C
+            high = mid - 1
+        elif len(coef_index) < sampleN:
+            low = mid + 1
+        else:
+            break
+
+    X2 = X_orig.iloc[:, coef_index].copy()
+    med, X2 = normalize_rp(X2, sqrt=False, return_median=True)
+    gene_mean = X2.mean(1)
+    X2 = X2.subtract(gene_mean, axis='index')
+
+    factors = X2.columns.get_level_values(0)
+    ids = X2.columns.get_level_values(1)
+
+    print >>fout, '\t'.join(list(ids))
+
+    idmap = {}; n = 0; maps = {}
+    for i, f in zip(ids, factors):
+        idmap[i] = n
+        maps[f] = maps.get(f, [i]) + [i]
+        n += 1
+
+    with h5py.File(factormap[f], 'r') as store:
+        dset = store[maps[f][0]][...]
+
+    d = np.empty(shape=(len(dset), len(factors)), dtype=np.float32)
+    d[:, idmap[maps[f][0]]] = dset
+
+    n = 0
+    for f in maps:
+        for i in maps[f]:
+            with h5py.File(factormap[f], 'r') as store:
+                dset = store[str(i)][...]
+            n += 1
+            d[:, idmap[i]] = dset
+
+    d_t = np.log2(d + 1)
+    X_t = d_t - np.median(d_t, axis=0)
+
+    X_s = X2.values
+    X_mix = np.concatenate([X_s, X_t], axis=0)
+
+    epsilon = np.concatenate([np.ones(X_s.shape[0]), np.zeros(X_t.shape[0])])
+
+    p_mix_prior = X_s.shape[0] / X_t.shape[0]
+
+    L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+                                         n_jobs=10,
+                                         dual=False, random_state=seed)
+    Cs = []
+    i = 100.0
+    while i >= 0.01:
+        Cs.append(i)
+        i /= 3
+
+    print(X_mix.shape)
+    print(epsilon.shape)
+    gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+    gs.fit(X_mix, epsilon)
+    print('get parameters...')
+
+    coefs = []
+    aucs = []
+    for i in range(repeat_times):
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=gs.best_params_.get('C', 1),
+                                             n_jobs=10,
+                                             dual=False, random_state=seed)
+        L1.fit(X_mix, epsilon)
+        aucs.append(metrics.roc_auc_score(epsilon, L1.predict_log_proba(X_mix)[:,1]))
+        coefs.append(L1)
+
+    print(max(aucs))
+    A = coefs[np.argmax(aucs)]
+    prop = A.predict_proba(X_mix)
+
+    post_prop = prop[:, 0] / prop[:, 1]
+
+    reweight = p_mix_prior * post_prop
+
+    reweight = reweight[:X_s.shape[0]]
+
+    X_s = (X_s.T * reweight).T
+
+    L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+                                         n_jobs=10,
+                                         dual=False, random_state=seed)
+
+    Cs = []
+    i = 100.0
+    while i >= 0.01:
+        Cs.append(i)
+        i /= 3
+
+    gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+    gs.fit(X_s, Y.iloc[:, 0].values)
+    print('get parameters...')
+
+    coefs = []
+    aucs = []
+    for i in range(repeat_times):
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=gs.best_params_.get('C', 1),
+                                             n_jobs=10,
+                                             dual=False, random_state=seed)
+        L1.fit(X_s, Y.iloc[:, 0].values)
+        aucs.append(metrics.roc_auc_score(Y.iloc[:, 0].values, L1.predict_log_proba(X_s)[:,1]))
+        coefs.append(L1)
+
+    print(max(aucs))
+    A = coefs[np.argmax(aucs)]
+
+    factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+    with h5py.File(TF_h5, 'r') as store:
+        index = np.asarray(store[factor[fac]][...], dtype=np.int32)
+
+    # TF binding position
+    TF = np.zeros(d.shape[0])
+    TF[index-1] = 1
+
+    direct = A.predict_proba(X_t)[:, 1]
+    print >>fout, 'directLogisticRegression\tAUC\t' + str(metrics.roc_auc_score(TF, direct))
+    print >>fout, 'directLogisticRegression\tPR\t' + str(metrics.average_precision_score(TF, direct))
+    fout.close()
+    return
+
+
+def samplesNumberEffect(factormap, TF_h5, uDHS, cis, seed, repeat_times,
+                        X, Y, output, fac, feats, logit_delta_model=True,
+                        delta_model = True, cluster = True):
+    X_orig = X.loc[Y.index, :].copy()
+    print('_'.join(feats))
+    med, X = normalize_rp(X.loc[Y.index, :], sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+    X = X.subtract(gene_mean, axis='index')
+    for sampleN in range(2, 100, 2):
+        fout = open(os.path.join(output, fac + '_' + '_'.join(list(feats)) + '.limitsamplesN_%s'%sampleN), 'w')
+        C = np.arange(0.000001, 1, 0.000001)
+        high = len(C)-1
+        low = 0
+        while (low <= high):
+            mid = (low + high) / 2
+            L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid],
+                                                 n_jobs=5,
+                                                 dual=False, random_state=seed)
+            L1.fit(X.values, Y.iloc[:, 0].values)
+            coef, = L1.coef_
+            coef_index, = np.where(coef != 0)
+            if len(coef_index) > sampleN:
+                # too many samples, prefer stronger regularization, lower C
+                high = mid - 1
+            elif len(coef_index) < sampleN:
+                low = mid + 1
+            else:
+                break
+
+        X2 = X_orig.iloc[:, coef_index].copy()
+        med, X2 = normalize_rp(X2, sqrt=False, return_median=True)
+        gene_mean = X2.mean(1)
+        X2 = X2.subtract(gene_mean, axis='index')
+        k = 7
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+                                             n_jobs=10,
+                                             dual=False, random_state=seed)
+        Cs = []
+        i = 1000.0
+        while i >= 0.001:
+            Cs.append(i)
+            i /= 3
+        gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+        gs.fit(X2.values, Y.iloc[:, 0].values)
+
+        print('get parameters...')
+
+        coefs = []
+        aucs = []
+        for i in range(repeat_times):
+            L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=gs.best_params_.get('C', 1),
+                                                 n_jobs=10,
+                                                 dual=False, random_state=seed)
+            L1.fit(X2.values, Y.iloc[:, 0].values)
+            aucs.append(metrics.roc_auc_score(Y.iloc[:, 0].values, L1.predict_log_proba(X2.values)[:,1]))
+            coefs.append(L1.coef_)
+
+        print(max(aucs))
+        A, = coefs[np.argmax(aucs)]
+
+        features = X2.columns.get_level_values(0)
+        factors = X2.columns.get_level_values(0)
+        ids = X2.columns.get_level_values(1)
+
+        print >>fout, '\t'.join(list(ids))
+        print >>fout, '\t'.join(map(str, list(A)))
+
+        idmap = {}; n = 0; maps = {}
+        for i, f in zip(ids, factors):
+            idmap[i] = n
+            maps[f] = maps.get(f, [i]) + [i]
+            n += 1
+
+        with h5py.File(factormap[f], 'r') as store:
+            dset = store[maps[f][0]][...]
+
+        d = np.empty(shape=(len(dset), len(factors)), dtype=np.float32)
+        d[:, idmap[maps[f][0]]] = dset
+
+        n = 0
+        for f in maps:
+            for i in maps[f]:
+                with h5py.File(factormap[f], 'r') as store:
+                    dset = store[str(i)][...]
+                n += 1
+                d[:, idmap[i]] = dset
+
+        factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+        with h5py.File(TF_h5, 'r') as store:
+            index = np.asarray(store[factor[fac]][...], dtype=np.int32)
+
+        # TF binding position
+        TF = np.zeros(d.shape[0])
+        TF[index-1] = 1
+        cis_delta_RP_max = np.zeros( TF.shape[0] ) # d, for shifting of RP after deleting uDHS
+        cis_de_max = np.zeros( TF.shape[0] )       # d, for differential gene record
+
+        direct = np.dot(d, A)
+        print >>fout, 'directLogisticRegression\tAUC\t' + str(metrics.roc_auc_score(TF, direct))
+        print >>fout, 'directLogisticRegression\tPR\t' + str(metrics.average_precision_score(TF, direct))
+    fout.close()
+    return
+
+
+def Hist(factormap, TF_h5, uDHS, cis, seed, repeat_times,
+         X, Y, output, fac, feats, logit_delta_model=True,
+         delta_model = True, cluster = True):
+    factors = X.columns.get_level_values(0)
+    ids = X.columns.get_level_values(1)
+    idmap = {}; n = 0; maps = {}
+    for i, f in zip(ids, factors):
+        idmap[i] = n
+        maps[f] = maps.get(f, [i]) + [i]
+        n += 1
+    for sampleN in range(X.shape[1]):
+        rp = X.iloc[:, sampleN].values
+        fig = plt.figure()
+        plt.clf()
+        plt.hist(rp, bins=1000, color='red', label='original RP')
+        rp_trans = np.log2(rp + 1)
+        rp_trans = rp_trans - np.median(rp_trans)
+        plt.hist(rp_trans, bins=1000, color='', label='log2 tranformed RP')
+        with h5py.File(factormap[f], 'r') as store:
+            dset = store[str(ids[sampleN])][...]
+        plt.hist(dset, bins= 1000, col='blue', label='original uDHS read count')
+        dset_trans = np.log2(dset)
+        dset_trans = dset_trans - np.median(dset_trans)
+        plt.hist(dset_trans, bins= 1000, col='blue', label='log2 transformed uDHS read count')
+        plt.savefig(ids[sampleN] + '__' + factors[sampleN] + '.png', dpi=150)
+
+def normalize_ndarray(X, sqrt=True):
+    if sqrt:
+        X_norm = np.sqrt(X + 1)
+    else:
+        X_norm = np.log2(X + 1)
+    samples_median = np.median(X_norm, axis=0)
+    gene_mean = np.mean(X_norm, axis=1)
+    X_norm = X_norm - samples_median
+    X_norm = (X_norm.transpose() - gene_mean).transpose()
+    return X_norm, samples_median, gene_mean
+
+padding = int(1e5)
+alpha = 1e4
+alpha = -math.log(1.0/3.0)*1e5/alpha
+bl = 1000 # bin length
+binN = (2*padding+bl)/bl
+def balance_weight(distances):
+    weight = []
+    for z in distances:
+        z = math.exp(-alpha*math.fabs(z)/1e5)
+        weight.append(2.0*z/(1.0+z))
+    return np.array(weight, np.float32)
+
+seed = 999; repeat_times = 3; BW = 1e5
+class MotifDeltaRP:
+    def __init__(self, output, Y, c, chipseq, window=1000, inputsymbol=True, remove1kb=False):
+        configuration = ConfigParser.ConfigParser()
+        configuration.read(c)
+        self.output_prefix = os.path.join(output, os.path.basename(Y))
+        self.genome_count = configuration.get('uDHS', 'genome_count')
+        self.meta = configuration.get('basics', 'meta')
+        if not remove1kb:
+            self.RP = configuration.get('genes', 'RP')
+        else:
+            self.RP = configuration.get('genes', 'RP_TSS1kbremoved')
+        self.genome_window = configuration.get('uDHS', 'genome_window')
+        self.motif = configuration.get('uDHS', 'genome_1kb_piq_motif')
+        self.window = window
+        self.remove1kb = remove1kb
+        self.chipseq = chipseq
+        self.inputsymbol = inputsymbol
+        if not (os.path.exists(self.chipseq + '.index') and os.path.getsize(self.chipseq + '.index') > 0):
+            if os.path.exists(self.chipseq):
+                subprocess.call('awk \'{OFS=\"\\t\"; mid=int(($2+$3)/2); print $1,mid,mid+1,$4}\' %s | bedtools intersect -wa -u -a %s -b - | cut -f 4 > %s' % (self.chipseq, self.genome_window, self.chipseq + '.index'), shell=True)
+            else:
+                sys.exit(1)
+        self.chippos = []
+        # load ChIP-seq peak to validate
+        with open(self.chipseq + '.index') as inf:
+            for line in inf:
+                self.chippos.append(int(line.strip()))
+        with h5py.File(self.RP) as h5:
+            self.RP_IDs = h5['IDs'][...]
+            RP = h5['RP'][...]
+            self.RefSeq = h5['RefSeq'][...]
+        # 1 load TSS bin information
+        tssbin = configuration.get('genes', 'tssbin')
+        tssbin = pd.read_table(tssbin, header=None)
+        # symbol = tssbin.iloc[:, [0,1,2,3]].apply(lambda x: ':'.join(map(str, x)), axis=1).values
+        tssbincenter = (tssbin.iloc[:, -2].values + tssbin.iloc[:, -3].values)//2
+        tssp = tssbin.iloc[:, 1].values
+        chrs = tssbin.iloc[:, 0].values
+        tssbin = tssbin.iloc[:, -1].values
+        self.tssbinindex = []; self.bincenter = []; self.tss = []; self.chr = []
+        # 1.1 reference to mapping refseq and gene symbols
+        ref = set(); sym = set()
+        tref = {}; gref = {}; tgref = {} # transcripts
+        for i, r in enumerate(self.RefSeq):
+            r = r.split(':')
+            tref[r[-2]] = tref.get(r[-2], []) + [i]
+            gref[r[-1]] = gref.get(r[-1], []) + [i]
+            tgref[r[-2]] = r[-1]
+            ref.add(r[-2])
+            sym.add(r[-1])
+        # loading limma table with all transcripts refseq
+        if not inputsymbol:
+            diff = pd.read_table(Y, index_col=3)
+            ref = list(set(diff.index) & ref)
+            sym = list(set(diff.symbol) & sym)
+            diff = diff.ix[diff.index.isin(ref),:]
+            diff = diff.ix[diff.symbol.isin(sym),:]
+            # 2. differential expression
+            diffbool = (diff["fdr"] < 0.01) & (diff["logfc"] >= 1)
+            nondiffbool = ~diffbool
+            up  = diff.ix[diffbool, :]
+            com = diff.ix[nondiffbool, :]
+            diff = pd.concat([up, com])
+            self.diff = diff
+            self.genes = diff.index # all genes for transcripts
+            self.nup = up.shape[0]  # all up regulated transcripts
+            # 3. merge RP and DE based on symbols
+            up_symbols = list(set(up.symbol))
+            symbols = up_symbols + list(set(com.symbol))
+        else: # gene only text file
+            # loading refseq gene list only, one refseq per line
+            diff = set()
+            # refseq only now
+            with open(Y) as inf:
+                for line in inf:
+                    diff.add(line.strip())
+            up = list(ref & diff)
+            com = list(ref - diff)
+            self.genes = up + com # all genes
+            self.nup = len(up)
+            # gene symbol RP
+            up_symbols = set()
+            com_symbols = set()
+            for s in up:
+                up_symbols.add(tgref[s])
+            for s in com:
+                com_symbols.add(tgref[s])
+            up_symbols = list(up_symbols)
+            symbols = up_symbols + list(com_symbols)
+        # transcripts RP
+        self.TRP = np.zeros((len(self.genes), len(self.RP_IDs)))
+        for i, di in enumerate(self.genes): ## add support for symbols later
+            self.TRP[i, :] = RP[tref[di][0]]
+            self.tssbinindex.append(tssbin[tref[di][0]])
+            self.bincenter.append(tssbincenter[tref[di]][0])
+            self.tss.append(tssp[tref[di][0]])
+            self.chr.append(chrs[tref[di][0]])
+        self.RP = np.zeros((len(symbols), len(self.RP_IDs)))
+        for row, r in enumerate(symbols):
+            self.RP[row] = RP[gref[r][0]]
+
+        # 4. sample filter by ChiLin quality
+        self.qc_filter() # self.RP_IDs->high quality IDs, self.RP => self.X_orig, self.TRP => high quality self.TRP
+        # 5. assign DE Y variable for gene symbol
+        self.Y = np.zeros(len(symbols), dtype=np.int32)
+        self.Y[:len(up_symbols)] = 1
+        # 6. normalize RP based on log2 (False)
+        self.X, _, _ = normalize_ndarray(self.X_orig, False)
+        # # 7. all transcripts annotation for deltaRP calculation
+        gene_f = open("%s.pos" % self.output_prefix, 'w')
+        for o in range(len(up_symbols)):
+            print >>gene_f, '%s\t%s:%s-%s' % (self.genes[o],  self.chr[o], int(self.tss[o]-1e5), int(self.tss[o]+1e5))
+        gene_f.close()
+
+    def select_rp_features(self, feat_num=15):
+        C = np.arange(0.000001, 0.09, 0.000001); high = len(C)-1; low = 0
+        while low <= high:
+            mid = (low + high) / 2
+            L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid], dual=False, random_state=seed)
+            L1.fit(self.X, self.Y)
+            coef, = L1.coef_
+            coef_index, = np.where(coef != 0)
+            print(C[mid])
+            if len(coef_index) > feat_num:
+                # too many samples, prefer stronger regularization, lower C
+                high = mid - 1
+            elif len(coef_index) < feat_num:
+                low = mid + 1
+            else:
+                break
+        return coef_index
+
+    def qc_filter(self, assay='H3K27ac'):
+        qc = pd.read_csv(self.meta)
+        self.qc = qc
+        # H3K27ac cutoff
+        selector = (qc['UniquelyMappedRatio'] > 0.5) & (qc['MappedReadsNumber'] > 5e6) & (qc['AllPeaksNumber'] > 1000) & (qc['PBC'] > 0.85) & (qc['FRiP'] > 0.1) & (qc['FactorName'] == assay)
+        IDs = qc.ix[selector, 'X']
+        idmap = {}
+        for i, z in enumerate(self.RP_IDs):
+            idmap[str(z)] = i
+        IDs = sorted(list(IDs))
+        index = []
+        for i in IDs:
+            if idmap.has_key(str(i)):
+                index.append(idmap[str(i)])
+        self.RP_IDs = self.RP_IDs[index]
+        self.X_orig = self.RP[:, index]
+        self.TRP = self.TRP[:, index]
+        return index
+
+    def build_expression_model(self, feat_num=15):
+        """ select features to build expression model
+        :param X: Gene RP hdf5 file
+        :param Y: differential gene list file
+        :return: coefficients, ID features, chrom_tss, start_tss
+        """
+        # Select based on l1 regression
+        coef_index = self.select_rp_features(feat_num)
+        self.X_orig = self.X_orig[:, coef_index]
+        self.TRP = self.TRP[:, coef_index]
+        self.features = self.RP_IDs[coef_index]
+
+        # log2 transformation
+        self.X, _, _ = normalize_ndarray(self.X_orig, False)
+        self.NTRP, self.samples_median, self.gene_mean = normalize_ndarray(self.TRP, False)
+
+        # cross validation to select the optimal C
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1, dual=False, random_state=seed)
+        Cs = []; i = 100.0
+        while i >= 0.01:
+            Cs.append(i)
+            i /= 3
+        scorer = make_scorer(roc_auc_score)
+        gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=12, scoring = scorer, cv=3)
+        gs.fit(self.X, self.Y)
+        coefs = []; aucs = []; models = []
+        for i in range(repeat_times):
+            L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01,
+                                                 C=gs.best_params_.get('C', 1), dual=False, random_state=seed+i)
+            L1.fit(self.X, self.Y)
+            aucs.append(roc_auc_score(self.Y, L1.predict_log_proba(self.X)[:,1]))
+            coefs.append(L1.coef_)
+            models.append(L1)
+        self.coefficients, = coefs[np.argmax(aucs)]
+        self.model = models[np.argmax(aucs)]
+        self.eaucs = aucs
+
+    def set_gene_sets(self, simple=True, lower=25, higher=75):
+        """ 
+        """
+        # 1. set treat and control gene sets simply by DE and RP range
+        np.random.seed(999)
+        # for tss, center, bi, trans in zip(self.tss, self.bincenter, self.tssbinindex, self.diff.index):
+        if simple:
+            self.diff_gene_index = self.Y == 1
+            self.control_gene_index = ~self.diff_gene_index
+            lower = np.percentile(self.gene_mean, lower)
+            higher = np.percentile(self.gene_mean, higher)
+            control_genes = (self.gene_mean >= lower) & (self.gene_mean <= higher)
+            self.control_gene_index = self.control_gene_index & control_genes
+
+            self.diff_gene_index, = np.where(self.diff_gene_index)
+            self.control_gene_index, = np.where(self.control_gene_index)
+            self.control_gene_index = np.random.choice(self.control_gene_index, len(self.diff_gene_index), False)
+        # 2. set treat and control gene as predicted DE genes and non-predicted non-DE
+        else:
+            # true DE
+            self.diff_gene_index = self.Y == 1
+            # true non-DE
+            self.control_gene_index = ~self.diff_gene_index
+
+            predictions = self.model.predict_log_proba(self.X)[:,1]
+            cutoff = np.sort(predictions)[::-1][sum(self.diff_gene_index)]
+            classes = np.zeros(len(predictions))
+            classes[predictions>=cutoff] = 1
+
+            # predicted DE
+            classes_diff = classes == 1
+            self.diff_gene_index, = np.where(self.diff_gene_index & classes_diff)
+            # non predicted
+            classes_cont = classes == 0
+            self.control_gene_index, = np.where(self.control_gene_index & classes_cont)
+
+    def load_read_count_validate_exp_model(self, factor='AR', feat_num=15):
+        count_idmap = {}; count_selected_ids = []
+        with h5py.File(self.genome_count) as count_store:
+            count_ids = count_store['IDs'][...]
+            for i, count_id in enumerate(count_ids):
+                count_idmap[str(count_id)] = i
+            for feature in self.features:
+                count_selected_ids.append(count_idmap[str(feature)])
+            # sort the index for h5py File
+            sorted_ids = sorted(zip(self.features, count_selected_ids), key=lambda x:x[1])
+            count_selected_ids = map(lambda x: x[1], sorted_ids)
+            self.count = count_store['OrderCount'][:, count_selected_ids][...]
+            # NOTE!!: keep the coefficients and features the same order as index
+            features_order = {}
+            for i, f in enumerate(self.features):
+                features_order[f] = i
+            coefs = []
+            self.TRP_order = np.zeros(self.TRP.shape)
+            self.NTRP_order = np.zeros(self.NTRP.shape)
+            # ordered features ids and coefficients
+            # reorder transcripts RP along with the read count
+            self.features = np.array(map(lambda x:x[0], sorted_ids), dtype=np.str)
+            for col, i in enumerate(self.features):
+                coefs.append(self.coefficients[features_order[i]])
+                self.TRP_order[:,col] = self.TRP[:, features_order[i]]
+                self.NTRP_order[:,col] = self.NTRP[:, features_order[i]]
+            self.coefficients = np.array(coefs)
+
+        order_coef = np.argsort(np.abs(self.coefficients))[::-1][:10]
+        out_features = self.features[order_coef]
+        out_coef = self.coefficients[order_coef]
+        # self.features = self.features[np.argsort(np.abs(self.coefficients))[::-1]]
+        # prepare DataFrame header
+        if self.remove1kb:
+            header = [ "%s_%s_%s_removepromoter" % (i, str(list(self.qc.ix[self.qc['X']==int(x), 'cell_line'])[0]), str(round(y, 2))) for i, x, y in zip(out_features, out_features, out_coef) ]
+        else:
+            header = [ "%s_%s_%s_all" % (i, str(list(self.qc.ix[self.qc['X']==int(x), 'cell_line'])[0]), str(round(y, 2))) for i, x, y in zip(out_features, out_features, out_coef) ]
+        self.header = header
+        # prepare DataFrame row
+        self.order_coef = order_coef
+        # output the samples with the top 10 coefficients
+        OutputRP = self.TRP_order[:, order_coef]
+        OutputRP = pd.DataFrame(OutputRP, index=self.genes, columns=header)
+        self.margeRP  = np.dot(self.NTRP_order, self.coefficients)
+        margeRP = pd.DataFrame(self.margeRP, index=self.genes, columns=['MARGEExpressRP'])
+        with open(self.output_prefix + '.coefid.%s' % feat_num, 'w') as fout:
+            for i, j in zip(out_features, out_coef):
+                print >>fout, "%s\t%s" % (i, j)
+        Output = pd.concat([OutputRP, margeRP], axis=1)
+        print('features', len(self.features))
+        self.Ncount, _, _ = normalize_ndarray(self.count, False)
+        rp_sall = np.dot(self.Ncount, self.coefficients)
+        index = np.asarray(self.chippos, dtype=np.int32) - 1
+        TF = np.zeros(self.count.shape[0])
+        TF[index] = 1
+        self.TF = TF
+        self.TFindex = index
+        self.directauc = 'direct prediction: %s' % metrics.roc_auc_score(TF, rp_sall)
+        self.directpr = 'direct prediction: %s' % metrics.average_precision_score(TF, rp_sall)
+        if self.remove1kb:
+            fout = self.chipseq + '.direct.%s.remove1kb' % feat_num
+            fout2 = self.output_prefix + '.motif.deltaRP.%s.remove1kb' % feat_num
+        else:
+            fout = self.chipseq + '.direct.%s' % feat_num
+            fout2 = self.output_prefix + '.motif.deltaRP.%s' % feat_num
+
+        with open(fout, 'w') as inf:
+            print >>inf, self.directauc
+            print >>inf, self.directpr
+        with open(fout2, 'w') as fout:
+            print >>fout, max(self.eaucs)
+            print >>fout, '\t'.join(self.features)
+            print >>fout, '\t'.join(map(str, list(self.coefficients)))
+        return Output
+
+    def motif_delta_rp(self, motif_cutoff=99.5): # 15000 motif site
+        delta = self.genome_window_search_index('chipseq', label='all', sqrt=False)
+        # use differential genes vs control genes set
+        # self.set_gene_sets()
+
+        # loading motif index
+        if self.inputsymbol:
+            motifs_iter = load_motif_index(self.motif, motif_cutoff)
+            for motif, motif_index in motifs_iter:
+                self.TFindex = motif_index
+                #self.genome_window_search_index(motif, label='all', sqrt=False, onlydiff=True)
+                self.genome_window_search_index(motif, label='all', sqrt=False, onlydiff=False)
+        return delta
+
+    def plot(self):
+        self.set_gene_sets()
+        self.plot_signal_motif_chipseq('chipseq', self.TF, self.diff_gene_index, label='diff')
+        self.plot_signal_motif_chipseq('chipseq', self.TF, self.control_gene_index, label='non')
+
+    def plot_signal_motif_chipseq(self, motif, motif_index, index, label='diff', sqrt=True):
+        """
+        because we use 1kb centered on uDHS for read count, there are multiple regions
+        overlap with the same TF ChIP-seq peaks ( or motif ), for consecutive uDHS with TF peaks or motifs,
+        we use the average read count of H3K27ac (DNase, K4..) for those consecutive uDHS.
+        # NOTCH_up_genes.txt_motif_deltaRP.diff
+        """
+        for i in index:
+            chrom = self.chrom_tss[i]
+            start = self.start_tss[i]
+            if not self.cis_dict.has_key(chrom):
+                continue
+
+            # binary search for uDHS
+            left = 0 if start - BW < 0 else start - BW
+            left_margin = bisect_left(self.cis_dict[chrom][0], left)
+            left_margin = self.cis_dict[chrom][1][left_margin]
+            right_margin = bisect_right(self.cis_dict[chrom][0], start+BW)
+
+            # -1 in case out of the chromosome end
+            right_margin = self.cis_dict[chrom][1][right_margin-1]
+            # focus on the uDHS with motif hits only 0-based index
+            uDHS_index = right_margin  - left_margin + 1
+
+            motif_left_margin = bisect_left(motif_index, left_margin)
+            motif_right_margin = bisect_right(motif_index, right_margin)
+            motif_uDHS = motif_index[(motif_left_margin+1):motif_right_margin]
+
+            motif_uDHS_len = motif_right_margin-motif_left_margin
+            if motif_uDHS_len == 0:
+                continue
+            cispos = self.mid_cis[motif_uDHS]
+            cisval = self.uDHS_count[motif_uDHS]
+            # get RP for the gene
+            # n_d x m
+            RP_new = gene_rp_deleting_motifs(self.X_orig[i], cisval, cispos-start, self.window)
+            # m,
+            if sqrt: 
+                RP_new = np.sqrt(RP_new + 1)
+            else:
+                RP_new = np.log2(RP_new + 1)
+
+            # m, - m,
+            RP_new = RP_new - self.samples_median
+            # m, - 1
+            RP_new = RP_new - self.gene_mean[i]
+            # shift in rp on deletion of element for a gene
+            # expression logit prediction for a gene
+            # m, x m, => 1
+            rp_s0 = np.dot(self.coefficients, self.X[i])
+            # 1 - m, * m, = 1
+            # original prediction - subtracted prediction
+            dz    = rp_s0 - np.dot(self.coefficients, RP_new)
+            uDHS_pos = self.mid_cis[left_margin:right_margin]
+            uDHS_vals = self.uDHS_count[left_margin:right_margin].transpose()
+            fout = open(self.output_prefix + "__" + self.genes[i] + '__%s_for_plot.%s' % (motif, label), 'a')
+            print >>fout, "#"+motif+"__"+chrom+"__"+str(start)
+            print >>fout, "#%s" % (self.directauc)
+            print >>fout, "#Delta RP: %s" % dz
+            cispos = self.mid_cis[motif_uDHS]
+
+            motif_binary = np.zeros(uDHS_index, dtype=np.int32)
+            uDHS_tmp_index = range(left_margin, right_margin)
+            motif_binary[np.in1d(uDHS_tmp_index, motif_uDHS)] = 1
+
+            print >>fout, 'DistanceTSS\t%s' % ('\t'.join(map(str, uDHS_pos-start)))
+            for enum in range(uDHS_vals.shape[0]):
+                print >>fout, '%s\t%s'%(enum, '\t'.join(map(str, uDHS_vals[enum])))
+            print >>fout, '%s_position\t%s'%(motif, '\t'.join(map(str, motif_binary)))
+            fout.close()
+        return
+
+    def genome_window_search_index(self, motif, label='diff', sqrt=False, onlydiff=False):
+        """
+        genome was segmented into 1kb windows per chromosome
+        """
+        # store the original RP after deleting 1kb windows containting TF ChIP peaks
+        deletion_rp = np.zeros((len(self.genes), len(self.features)), dtype=np.float32)
+        if self.remove1kb:
+            fout = open(self.output_prefix + '_motif_deltaRP.%s.%s_remove1kb' % (label, self.window), 'a')
+            # frp = open(self.output_prefix + '_gene_rp_compare_remove1kb.%s.%s.txt' % (label, self.window), 'w')
+        else:
+            fout = open(self.output_prefix + '_motif_deltaRP.%s.%s' % (label, self.window), 'a')
+            # frp = open(self.output_prefix + '_gene_rp_compare.%s.%s.txt' % (label, self.window), 'w')
+        # print >>fout, '\t'.join(map(str, ["MOTIF", "GENES", "BINS", "TFNUM", "DeltaRP"]))
+        tfs = []; dzs = []
+        row = 0
+        for tss, center, bi, trans in zip(self.tss, self.bincenter, self.tssbinindex, self.genes):
+            if onlydiff:
+                if row + 1 > self.nup:
+                    break
+            if row + 1 <= self.nup:
+                diff = '1'
+            else:
+                diff = '0'
+            bi -= 1 # NOTE: index
+            left = bi - 100 if bi >= 100 else 0
+            right = bi + 101
+            leftw = 100 - (bi-left)
+            rightw = 100 + (right-bi)
+            import bisect
+            binrange = np.arange(left, right)
+            position = np.in1d(binrange, self.TFindex)
+            poslen = np.sum(position)
+            # bisect.bisect(left, self.TFindex)
+            # bisect.bisect(right, self.TFindex)
+            if poslen == 0:
+                print >>fout, '\t'.join(map(str, [motif, trans, right - left, poslen, 0, diff]))
+                tfs.append(poslen)
+                dzs.append(0)
+                deletion_rp[row] = self.TRP_order[row]
+                row += 1
+                continue
+            # bin centers location
+            centers = np.arange(center - padding, center + padding + bl, bl)
+            # TSS weight offset from nearest bin
+            self.weight = balance_weight(centers - tss)
+
+            # raw deletion RP, considering chromosome boundary
+            weightd = self.weight[leftw:rightw][position]
+            countd = self.count[binrange][position]
+            average_bin_rp = np.dot(weightd, countd)
+            deletion_rp[row] = self.TRP_order[row] - self.window * average_bin_rp
+            # already remove the +/- promoter
+            # if cis-element (TF or motif) locates at promoter region
+            # then add back the TSS bin RP to avoid negative values
+            if self.remove1kb:
+                left = bi - 1 if bi >= 1 else 0
+                right = bi + 2
+                binrange = np.arange(left, right)
+                leftw = 1 - (bi-left)
+                rightw = 1 + (right-bi)
+                position = np.in1d(binrange, self.TFindex)
+                if np.sum(position) >= 1:
+                    # bin centers location
+                    centers = np.arange(center - bl, center + bl + bl, bl)
+                    biweight = balance_weight(centers - tss)
+                    # adding 3 bins RP back for original RP without promoters, a little bias
+                    deletion_rp[row] = deletion_rp[row] + self.window * np.dot(biweight[leftw:rightw][position], self.count[binrange][position])
+
+            RP_new = deletion_rp[row]
+             # m,
+            if sqrt:
+                RP_new = np.sqrt(RP_new + 1)
+            else:
+                RP_new = np.log2(RP_new + 1)
+
+            # m, - m,
+            RP_new = RP_new - self.samples_median
+            # m, - 1
+            RP_new = RP_new - self.gene_mean[row]
+            # shift in rp on deletion of element for a gene
+            # expression logit prediction for a gene
+            # m, x m, => 1
+            rp_s0 = self.margeRP[row]
+            # 1 - m, * m, = 1
+            # original prediction - subtracted prediction
+            subtraction = np.dot(RP_new, self.coefficients)
+            dz    = rp_s0 - subtraction
+            print >>fout, '\t'.join(map(str, [motif, trans, right-left, poslen, dz, diff]))
+            tfs.append(poslen)
+            dzs.append(dz)
+            row += 1 # increase row number
+        fout.close()
+        # frp.close()
+
+        if not self.inputsymbol:
+            delta =  pd.DataFrame({"BinTFPeak": tfs, "DeltaRP": dzs}, index=self.genes)
+            deletion_rp = pd.DataFrame(deletion_rp[:, self.order_coef], index=self.genes, columns=map(lambda x: 'deletion_%s' % x, self.header))
+            return pd.concat([delta, deletion_rp], axis=1)
+
+def subtractive_RP_complex(factormap, TF_h5, uDHS, cis, seed, repeat_times,
+                           X, Y, output, fac, feats, logit_delta_model=True,
+                           delta_model = True, cluster = True):
+    """
+    :param seed: random seed
+    :param X: pandas DataFrame of gene RP
+    :param Y: differential expression DataFrame
+    :param fac: factor name
+    :return: delta_RP
+    """
+
+    X_orig = X.loc[Y.index, :].copy()
+    print('_'.join(feats))
+    fout = open(os.path.join(output, fac + '_' + '_'.join(list(feats)) + '.feature.performance'), 'w')
+    med, X = normalize_rp(X.loc[Y.index, :], sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+
+    X = X.subtract(gene_mean, axis='index')
+
+    C = np.arange(0.0001, 0.1, 0.0001)
+
+    high = len(C)-1
+    low = 0
+    while (low <= high):
+        mid = (low + high) / 2
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid],
+                                             n_jobs=5,
+                                             dual=False, random_state=seed)
+        L1.fit(X.values, Y.iloc[:, 0].values)
+        coef, = L1.coef_
+        coef_index, = np.where(coef != 0)
+        if len(coef_index) > 80:
+            # too many samples, prefer stronger regularization, lower C
+            high = mid - 1
+        elif len(coef_index) < 30:
+            low = mid + 1
+        else:
+            break
+
+    X = X_orig.iloc[:, coef_index].copy()
+    X_orig = X.copy()
+
+    med, X = normalize_rp(X, sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+    X = X.subtract(gene_mean, axis='index')
+    k = 7
+
+    L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+                                         n_jobs=10,
+                                         dual=False, random_state=seed)
+    Cs = []
+    i = 100.0
+    while i >= 0.01:
+        Cs.append(i)
+        i /= 3
+
+    gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+    gs.fit(X.values, Y.iloc[:, 0].values)
+
+    print('get parameters...')
+
+    coefs = []
+    aucs = []
+    for i in range(repeat_times):
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=gs.best_params_.get('C', 1),
+                                             n_jobs=10,
+                                             dual=False, random_state=seed)
+        L1.fit(X.values, Y.iloc[:, 0].values)
+        aucs.append(metrics.roc_auc_score(Y.iloc[:, 0].values, L1.predict_log_proba(X.values)[:,1]))
+        coefs.append(L1.coef_)
+
+    print(max(aucs))
+    A, = coefs[np.argmax(aucs)]
+
+    features = X.columns.get_level_values(0)
+    factors = X.columns.get_level_values(0)
+    ids = X.columns.get_level_values(1)
+
+    print >>fout, '\t'.join(list(ids))
+
+    idmap = {}; n = 0; maps = {}
+    for i, f in zip(ids, factors):
+        idmap[i] = n
+        maps[f] = maps.get(f, [i]) + [i]
+        n += 1
+
+    with h5py.File(factormap[f], 'r') as store:
+        dset = store[maps[f][0]][...]
+
+    d = np.empty(shape=(len(dset), len(factors)), dtype=np.float32)
+    d[:, idmap[maps[f][0]]] = dset
+
+    n = 0
+    for f in maps:
+        for i in maps[f]:
+            with h5py.File(factormap[f], 'r') as store:
+                dset = store[str(i)][...]
+            n += 1
+            d[:, idmap[i]] = dset
+
+    factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+    with h5py.File(TF_h5, 'r') as store:
+        index = np.asarray(store[factor[fac]][...], dtype=np.int32)
+
+    # TF binding position
+    TF = np.zeros(d.shape[0])
+    TF[index-1] = 1
+    cis_delta_RP_max = np.zeros( TF.shape[0] ) # d, for shifting of RP after deleting uDHS
+    cis_de_max = np.zeros( TF.shape[0] )       # d, for differential gene record
+
+    #d_test = np.log2(d + 1)
+    #d_test = d_test - np.median(d_test, axis=0)
+    direct = np.dot(d, A)
+    print >>fout, 'directLogisticRegression\tAUC\t' + str(metrics.roc_auc_score(TF, direct))
+    print >>fout, 'directLogisticRegression\tPR\t' + str(metrics.average_precision_score(TF, direct))
+
+    directOut = open(os.path.join(output, fac + '_' + '_'.join(list(feats)))+'.directOut', 'w')
+    for i in direct:
+        print >>directOut, i
+    directOut.close()
+
+    cis_dict = OrderedDict()
+    chrom_cis = []
+    mid_cis = []
+    i = 0
+    # uDHS is already sorted and union
+    with open(uDHS) as inf:
+        for line in inf:
+            line = line.strip().split()
+            chrom_cis.append(line[0])
+
+            mid = (int(line[1])+int(line[2]))//2
+            mid_cis.append(mid)
+
+            if cis_dict.has_key(line[0]):
+                cis_dict[line[0]][0].append(mid)
+                cis_dict[line[0]][1].append(i)
+            else:
+                # 0: position, 1: index
+                cis_dict[line[0]] = [[mid], [i]]
+            i += 1
+
+    for key in cis_dict:
+        cis_dict[key][0] = np.array(cis_dict[key][0])
+        cis_dict[key][1] = np.array(cis_dict[key][1], dtype=np.int32)
+        cis_dict[key].append(len(cis_dict[key][0]))
+
+    # unordered version
+    chrom_cis = np.array(chrom_cis)
+    mid_cis = np.array(mid_cis, dtype=np.int32)
+
+    BW = 1e5
+    chrom_tss = Y.index.map(lambda x: x.split(':')[0])
+    start_tss = Y.index.map(lambda x: int(x.split(':')[1]))
+
+    # remove1kbTSS = False
+    # loop through all unique genes
+    for i in np.arange(Y.shape[0]):
+        chrom = chrom_tss[i]
+        start = start_tss[i]
+
+        # ordered binary search
+        if not cis_dict.has_key(chrom):
+            continue
+
+        if start-BW < 0:
+            left_margin = bisect_left(cis_dict[chrom][0], 0)
+        else:
+            left_margin = bisect_left(cis_dict[chrom][0], start-BW)
+
+        right_margin = bisect_right(cis_dict[chrom][0], start+BW)
+
+        # if remove1kbTSS:
+        #     if start < 1000:
+        #         left_margin1kb = bisect_left(cis_dict[chrom][0], 0)
+        #     else:
+        #         left_margin1kb = bisect_left(cis_dict[chrom][0], start-BW)
+        #     right_margin1kb = bisect_left(cis_dict[chrom][0], start+BW)
+
+        left_margin = cis_dict[chrom][1][left_margin]
+        # -1 in case out of the chromosome end
+        right_margin = cis_dict[chrom][1][right_margin-1]
+
+        n = right_margin - left_margin + 1
+        cisval = d[left_margin:(right_margin+1)]
+        cispos = mid_cis[left_margin:(right_margin+1)]
+
+        # get RP for the gene
+        # n_d x m
+        RP_new = rp_diff( X_orig.values[i], cisval, cispos-start )
+        RP_new = np.log2(RP_new + 1)
+        # RP_new = np.sqrt( RP_new )
+        # n_d x m - m,
+        RP_new = RP_new - med
+        # n_d x m - 1
+        RP_new = RP_new - gene_mean[i]
+
+        # shift in rp on deletion of element for a gene
+        # expression logit prediction for a gene
+        # m, x m, => 1
+        rp_s0 = np.dot(A, X.values[i])
+        # 1 - n_d x m * m, => 1 - n_d => n_d
+        # original prediction - subtracted prediction
+        dz    = rp_s0 - np.dot(RP_new, A)
+
+        # ordered version
+        cis_delta_RP_max[left_margin:(right_margin+1)] = np.fmax( cis_delta_RP_max[left_margin:(right_margin+1)], dz )
+
+        # whether the uDHS is within the range of 100kb of TSS
+        # all TSS or differential TSS, Y.iloc[i, 0] * or 1 *
+        cis_de_max[left_margin:(right_margin+1)]       = np.fmax( cis_de_max[left_margin:(right_margin+1)], Y.iloc[i, 0] * np.ones(n) )
+
+        # if remove1kbTSS:
+        #     cis_de_max[left_margin1kb:(right_margin1kb+1)] = 0
+
+    with open(os.path.join(output, fac + '_' + '_'.join(list(feats))) + '_delta_RP.txt', 'w') as outf:
+        for i, elem in enumerate(cis_de_max):
+            print >>outf, '\t'.join(map(str, [chrom_cis[i], mid_cis[i]-73, mid_cis[i]+73, TF[i], cis_delta_RP_max[i]]))
+
+    de_index = cis_de_max == 1
+    delta_model_y = cis_delta_RP_max[de_index]
+    delta_model_y = np.log2(delta_model_y + 1)
+    delta_model_y_copy = delta_model_y.copy()
+
+    delta_model_x = d[de_index]
+    delta_model_x = np.log2(delta_model_x+1)
+    delta_model_x = delta_model_x - np.median(delta_model_x, axis=0)
+
+
+    TF_o = TF.copy()
+    d_o = d.copy()
+
+    if logit_delta_model:
+        print('logistic delta...')
+        cutoff = 2.0 * np.mean(delta_model_y)
+
+        t = delta_model_y > cutoff
+        delta_model_y = np.zeros(len(delta_model_y))
+        delta_model_y[t] = 1
+
+        L1 = linear_model.LogisticRegression(penalty='l2', tol=0.01, C=0.5,
+                                             n_jobs=5,
+                                             dual=False, random_state=seed)
+
+        gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+        gs.fit(delta_model_x, delta_model_y)
+
+        print('get parameters...')
+        coefs = []
+        aucs = []
+        for i in range(repeat_times):
+            L1 = linear_model.LogisticRegression(penalty='l2', tol=0.01, C=gs.best_params_.get('C', 1),
+                                                 n_jobs=10,
+                                                 dual=False, random_state=seed)
+            L1.fit(delta_model_x, delta_model_y)
+            aucs.append(metrics.roc_auc_score(Y.iloc[:, 0].values, L1.predict_log_proba(X.values)[:,1]))
+            coefs.append(L1)
+
+        print(max(aucs))
+        best = coefs[np.argmax(aucs)]
+        TF_hat = best.predict_log_proba(d)[:, 1]
+
+        deltalogitOut = open(os.path.join(output, fac + '_' + '_'.join(list(feats)))+'.deltalogitOut', 'w')
+        for i in TF_hat:
+            print >>deltalogitOut, i
+        deltalogitOut.close()
+
+        auc, pr = plot_evaluation(TF, TF_hat, os.path.join(output, fac+'_logit'))
+
+        print >>fout, 'deltaRPlogisticRegression\tAUC\t' + str(auc)
+        print >>fout, 'deltaRPlogisticRegression\tPR\t' + str(pr)
+
+        if cluster:
+            d = delta_model_x
+            TF = TF[de_index]
+            print('cluster...')
+            kmeans = KMeans(init='k-means++', n_clusters=7, n_init=5, n_jobs=5)
+            kmeans.fit(d)
+
+            labels = kmeans.labels_
+            print(labels.shape)
+            sorted_index = np.argsort(labels)
+            print(sorted_index.shape)
+
+            # reorder index
+            cluster_labels = labels[sorted_index]
+            delta_model_y = delta_model_y[sorted_index]
+            TF_label = TF[sorted_index]
+            d = d[sorted_index]
+
+            feature_count = {}
+            factors = [features[0]]
+            for f in features:
+                # keep the factors order to draw rectangle
+                if f != factors[-1]:
+                    factors.append(f)
+                feature_count[f] = feature_count.get(f, 0) + 1
+
+            print(factors)
+            print(feature_count)
+
+            cluster_count = np.unique(cluster_labels, return_counts=True)
+            for label, count in zip(*cluster_count):
+                cluster_pos, = np.where(cluster_labels == label)
+
+                TF_pos = np.argsort(TF_label[cluster_pos])
+                TF_label[cluster_pos] = TF_label[cluster_pos][TF_pos]
+                delta_model_y[cluster_pos] = delta_model_y[cluster_pos][TF_pos]
+                d[cluster_pos] = d[cluster_pos][TF_pos]
+
+            cmap = plt.cm.get_cmap('RdBu_r')
+            plt.close('all')
+            fig = plt.figure()
+            fig.set_size_inches(35, 6)
+            ax = plt.subplot2grid((14,14), (0,0), rowspan=9, colspan=13)
+            d = d.T
+            dx, dy = 4, 4
+
+            y, x = np.mgrid[slice(-d.shape[0]*2, d.shape[0]*2 + dy, dy),
+                            slice(-d.shape[1]*2, d.shape[1]*2 + dx, dx)]
+
+            ax.set_title('RP for l1 selected %s samples against %s differential list' % (len(features), fac),
+                         fontweight='bold', fontsize=15)
+
+            ra = max(abs(d.min()), abs(d.max()))
+            # keep the original colors
+
+            heatmap = plt.pcolormesh(x, y, d, cmap=cmap,
+                                       vmin=-ra,
+                                       vmax=ra)
+
+            ax.set_frame_on(False)
+            ax.set_yticks(y[:, 0]+dy/2, minor=False)
+            ax.set_xticks(x[0]+dx/2, minor=False)
+            ax.set_xticklabels([], minor=False)
+            ax.set_yticklabels([], minor=False)
+            axr = plt.axis([x.min(), x.max(), y.min(), y.max()])
+            ax.grid(False)
+            for t in ax.xaxis.get_major_ticks():
+                t.tick1On = False
+                t.tick2On = False
+            for t in ax.yaxis.get_major_ticks():
+                t.tick1On = False
+                t.tick2On = False
+
+            # loop through a series of labels on heatmap side
+            colors = ['light olive', 'cornflower', 'azure', 'scarlet', 'orchid', 'orange red', 'pig pink', 'spruce',
+                      'tealish', 'orange', 'bright green', 'bright blue', 'dark pink', 'purple', 'green', 'pink',
+                      'brown', 'cyan', 'aquamarine', 'red']
+            cols = sns.xkcd_palette(colors)
+
+            ax = plt.subplot2grid((14,14), (0, 13), rowspan=9, colspan=1)
+            plt.axis([-1, 4, axr[2], axr[3]])
+            plt.axis('off')
+            shapes = []
+
+            start = 0; end = 0;
+            for index, f in enumerate(factors):
+                if index == 0:
+                    end = start + feature_count[f]
+                else:
+                    start = end
+                    end = start + feature_count[f]
+
+                print(start, end, feature_count[f])
+                shape = p.Rectangle((0, y[start, 0]), 3, y[end, 0]-y[start,0], color=cols[index], label=f)
+                shapes.append(shape)
+                ax.add_patch(shape)
+
+            ax = plt.subplot2grid((14,14), (9,0), rowspan=5, colspan=13)
+            plt.axis([axr[0], axr[1], -8, 17])
+            plt.axis('off')
+
+            i = 0; diff_labels = []
+            for tup, name in zip([delta_model_y, TF_label], ['Delta RP > 1.25mean', 'TF binding']):
+                diff_poss, = np.where(tup == 1)
+
+                # initialize
+                diff_label = p.Rectangle((x[0, 0], y[0, 0]-dy),
+                                         dx, float(dy)*2/3, color="k", label=name)
+
+                # label differential gene
+                for diff_pos in list(diff_poss):
+                    diff_label = p.Rectangle((x[0, diff_pos], 12+i*2),
+                                             dx/3, 2.0, color=cols[i], label=name)
+                    ax.add_patch(diff_label)
+
+                diff_labels.append(diff_label)
+                i += 1
+
+            cluster_labels_legend = []
+            cluster_legends = []
+            n = 0
+            for label, count in zip(*cluster_count):
+                cluster_pos, = np.where(cluster_labels == label)
+                if n%2 == 0:
+                    shift = 1.9
+                else:
+                    shift = -0.5
+                n += 1
+                plt.text((x[0, cluster_pos[-1]]+x[0, cluster_pos[0]])/2, 8.6+shift,
+                         str(round(float(sum(TF[cluster_pos]))/len(cluster_pos), 4)) + ' ; ' + str(sum(TF[cluster_pos])),
+                         fontsize=9, fontweight='bold', horizontalalignment='center')
+                cluster_label = p.Rectangle((x[0, cluster_pos[0]], 9.0),
+                                            x[0, cluster_pos[-1]]-x[0, cluster_pos[0]], 2.8,
+                                            color=cols[label], label='%s cluster' % label)
+                cluster_legends.append('%s cluster' % label)
+                cluster_labels_legend.append(cluster_label)
+                ax.add_patch(cluster_label)
+
+            plt.legend(handles=diff_labels + cluster_labels_legend + shapes,
+                       labels=['Delta RP', 'TF binding']+cluster_legends+factors,
+                       loc=3, bbox_to_anchor=(0., 0.00, 1., 0.12), mode='expand', ncol=5, frameon=False, fontsize=10)
+            plt.colorbar(heatmap, ax=ax, shrink=.8, orientation='horizontal')
+            plt.subplots_adjust(left=0.03, bottom=0.08, right=0.92, top=0.95, wspace=0.03, hspace=0.03)
+            fig.savefig(os.path.join(output, fac + '_high_delta.png'), dpi=200)
+
+    if delta_model:
+        l = linear_model.LinearRegression()
+        l.fit(delta_model_x, delta_model_y_copy)
+
+        TF_hat = l.predict(d_o)
+        # 
+        # fig = plt.figure()
+        # plt.scatter(TF_hat, cis_delta_RP_max)
+        # plt.xlabel("Predicted Delta RP")
+        # plt.ylabel("Real Delta RP")
+        # plt.title("Genome wide cis-elements")
+        # plt.savefig('%s_deltaRP.png' % fac)
+        deltaSimple = open(os.path.join(output, fac + '_' + '_'.join(list(feats)))+'.deltaSimple', 'w')
+        for i in TF_hat:
+            print >>deltaSimple, i
+        deltaSimple.close()
+
+        auc, pr = plot_evaluation(TF_o, TF_hat, os.path.join(output, fac))
+        print >>fout, 'deltaRPlinearregression\tAUC\t' + str(auc)
+        print >>fout, 'deltaRPlinearregression\tPR\t' + str(pr)
+
+    print "done..."
+    fout.close()
+
+def subtractive_RP(seed, repeat_times,  X, Y, fac):
+    """
+    :param seed: random seed
+    :param X: pandas DataFrame of gene RP
+    :param Y: differential expression DataFrame
+    :return: delta_RP
+    """
+    X_orig = X.loc[Y.index, :].copy()
+    med, X = normalize_rp(X.loc[Y.index, :], sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+
+    X = X.subtract(gene_mean, axis='index')
+
+    C = np.arange(0.0001, 0.1, 0.0001)
+
+    high = len(C)-1
+    low = 0
+    while (low <= high):
+        mid = (low + high) / 2
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=C[mid],
+                                             n_jobs=5,
+                                             dual=False, random_state=seed)
+        L1.fit(X.values, Y.iloc[:, 0].values)
+        print(C[mid])
+        coef, = L1.coef_
+        coef_index, = np.where(coef != 0)
+        if len(coef_index) > 100:
+            # too many samples, prefer stronger regularization, lower C
+            high = mid - 1
+        elif len(coef_index) < 50:
+            low = mid + 1
+        else:
+            break
+        print(len(coef_index), low, high)
+
+    X = X_orig.iloc[:, coef_index].copy()
+    X_orig = X.copy()
+
+    print(X.shape)
+    med, X = normalize_rp(X, sqrt=False, return_median=True)
+    gene_mean = X.mean(1)
+
+    X = X.subtract(gene_mean, axis='index')
+
+    L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+                                         n_jobs=10,
+                                         dual=False, random_state=seed)
+    Cs = []
+    i = 100.0
+    while i >= 0.01:
+        Cs.append(i)
+        i /= 3
+
+    print(len(Cs))
+
+    # L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=1,
+    #                                      n_jobs=10,
+    #                                      dual=False, random_state=seed)
+    gs = GridSearchCV(L1, param_grid={"C": Cs}, n_jobs=10, cv=3)
+    gs.fit(X.values, Y.iloc[:, 0].values)
+
+    print(gs.best_params_)
+    print(gs.best_score_)
+    print(gs.best_params_.get('C', 1))
+    print('get parameters...')
+
+    coefs = []
+    aucs = []
+    for i in range(repeat_times):
+        L1 = linear_model.LogisticRegression(penalty='l1', tol=0.01, C=gs.best_params_.get('C', 1),
+                                             n_jobs=10,
+                                             dual=False, random_state=seed)
+        L1.fit(X.values, Y.iloc[:, 0].values)
+        aucs.append(metrics.roc_auc_score(Y.iloc[:, 0].values, L1.predict_log_proba(X.values)[:,1]))
+        coefs.append(L1.coef_)
+
+    print(max(aucs))
+    A, = coefs[np.argmax(aucs)]
+    print(A.shape)
+
+    # A = A[A!=0]
+    # X_orig = X_orig.ix[:, A!=0]
+    # X = X.ix[:, A!=0]
+    #
+    # med = X_orig.median(axis=0)
+    # gene_mean = X_orig.median(axis=1)
+    #
+    # print(X.shape, X_orig.shape)
+
+    features = X.columns.get_level_values(0)
+    m = len(features)
+    factors = X.columns.get_level_values(0)
+    ids = X.columns.get_level_values(1)
+
+    idmap = {}; n = 0; maps = {}
+    for i, f in zip(ids, factors):
+        idmap[i] = n
+        maps[f] = maps.get(f, [i]) + [i]
+        n += 1
+
+    with h5py.File(glob.glob(os.path.expanduser("~/12_data/MARGE/*%s*h5" % f))[0], 'r') as store:
+        dset = store[maps[f][0]][...]
+
+    d = np.empty(shape=(len(dset), len(factors)), dtype=np.float32)
+    d[:, idmap[maps[f][0]]] = dset
+
+    n = 0
+    for f in maps:
+        for i in maps[f]:
+            with h5py.File(glob.glob(os.path.expanduser("~/12_data/MARGE/*%s*h5" % f))[0], 'r') as store:
+                dset = store[str(i)][...]
+            n += 1
+            d[:, idmap[i]] = dset
+
+    factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+
+    with h5py.File(os.path.expanduser('~/12_data/MARGE/hg38_UDHS_TF_intersect.h5'), 'r') as store:
+        index = np.asarray(store[factor[fac]][...], dtype=np.int32)
+
+    # TF binding position
+    TF = np.zeros(d.shape[0])
+    TF[index-1] = 1
+    cis_delta_RP_max = np.zeros( TF.shape[0] ) # d, for shifting of RP after deleting uDHS
+    cis_de_max = np.zeros( TF.shape[0] )       # d, for differential gene record
+
+    print(metrics.roc_auc_score(TF, np.dot(d, A)))
+    print(metrics.average_precision_score(TF, np.dot(d, A)))
+
+
+    cis_dict = OrderedDict()
+    chrom_cis = []
+    mid_cis = []
+    i = 0
+    # uDHS is already sorted and union
+    with open(os.path.expanduser("~/12_data/MARGE/human_unionDHS_fc5_75merge_split.bed")) as inf:
+        for line in inf:
+            line = line.strip().split()
+            chrom_cis.append(line[0])
+
+            mid = (int(line[1])+int(line[2]))//2
+            mid_cis.append(mid)
+
+            if cis_dict.has_key(line[0]):
+                cis_dict[line[0]][0].append(mid)
+                cis_dict[line[0]][1].append(i)
+            else:
+                # 0: position, 1: index
+                cis_dict[line[0]] = [[mid], [i]]
+            i += 1
+
+    for key in cis_dict:
+        cis_dict[key][0] = np.array(cis_dict[key][0])
+        cis_dict[key][1] = np.array(cis_dict[key][1], dtype=np.int32)
+        cis_dict[key].append(len(cis_dict[key][0]))
+
+    # unordered version
+    chrom_cis = np.array(chrom_cis)
+    mid_cis = np.array(mid_cis, dtype=np.int32)
+
+    BW = 1e5
+    chrom_tss = Y.index.map(lambda x: x.split(':')[0])
+    start_tss = Y.index.map(lambda x: int(x.split(':')[1]))
+
+    # loop through all unique genes
+    for i in np.arange(Y.shape[0]):
+        # if i>=100:
+        #     break
+        chrom = chrom_tss[i]
+        start = start_tss[i]
+
+        if Y.iloc[i, 0] == 1:
+            de = 1
+        else:
+            de = 0
+
+        # ordered binary search
+        if not cis_dict.has_key(chrom):
+            continue
+
+        if start-BW < 0:
+            left_margin = bisect_left(cis_dict[chrom][0], 0)
+        else:
+            left_margin = bisect_left(cis_dict[chrom][0], start-BW)
+        right_margin = bisect_right(cis_dict[chrom][0], start+BW)
+
+        left_margin = cis_dict[chrom][1][left_margin]
+        # -1 in case out of the chromosome end
+        right_margin = cis_dict[chrom][1][right_margin-1]
+
+        n = right_margin - left_margin + 1
+        cisval = d[left_margin:(right_margin+1)]
+        cispos = mid_cis[left_margin:(right_margin+1)]
+
+        # unordered search version
+        # identify all cis-elements within range of the gene
+        # t = ( chrom_cis == chrom )
+        # s = ( mid_cis > (start-BW) ) & (mid_cis < (start+BW))
+        # # n_d: the dhs within the range of TSS
+        # n = np.sum( 1*( s & t ) )
+        # #the position and values of cis element within the TSS range
+        # # n_d,
+        # cispos = mid_cis[s & t]
+        # # n_d x m
+        # cisval = d[s & t]
+
+        # get RP for the gene
+        # n_d x m
+        RP_new = rp_diff( X_orig.values[i], cisval, cispos-start )
+        RP_new = np.log2( RP_new + 1 )
+        # RP_new = np.sqrt( RP_new )
+        # n_d x m - m,
+        RP_new = RP_new - med
+        # n_d x m - 1
+        RP_new = RP_new - gene_mean[i]
+
+        # shift in rp on deletion of element for a gene
+        # expression logit prediction for a gene
+        # m, x m, => 1
+        rp_s0 = np.dot(A, X.values[i])
+        # 1 - n_d x m * m, => 1 - n_d => n_d
+        # original prediction - subtracted prediction
+        dz    = rp_s0 - np.dot(RP_new, A)
+        # same cis-element may be within range of several genes - record max shift
+        # n_d compare n_d
+
+        # unordered version
+        # cis_delta_RP_max[s & t] = np.fmax( cis_delta_RP_max[s & t], dz )
+        # # same cis-element may be within range of several genes - record if any gene is de
+        # # n_d compare n_d
+        # cis_de_max[s & t]       = np.fmax( cis_de_max[s & t], de*np.ones(n) )
+        # ordered version
+        cis_delta_RP_max[left_margin:(right_margin+1)] = np.fmax( cis_delta_RP_max[left_margin:(right_margin+1)], dz )
+        cis_de_max[left_margin:(right_margin+1)]       = np.fmax( cis_de_max[left_margin:(right_margin+1)], de*np.ones(n) )
+
+    delta_model = True
+    de_index = cis_de_max == 1
+    delta_model_y = cis_delta_RP_max[de_index]
+    delta_model_y = np.log2(delta_model_y + 1)
+
+    delta_model_x = d[de_index]
+    # delta_model_x = np.sqrt(delta_model_x)
+    delta_model_x = np.log2(delta_model_x+1)
+
+    delta_model_x = delta_model_x - np.median(delta_model_x, axis=0)
+
+    # d = np.sqrt(d)
+    d = np.log2(d+1)
+    d = d - np.median(d, axis=0)
+
+    if delta_model:
+        l = linear_model.LinearRegression()
+        l.fit(delta_model_x, delta_model_y)
+
+        TF_hat = l.predict(d)
+
+        fig = plt.figure()
+        plt.scatter(TF_hat, cis_delta_RP_max)
+        plt.xlabel("Predicted Delta RP")
+        plt.ylabel("Real Delta RP")
+        plt.title("Genome wide cis-elements")
+        plt.savefig('%s_deltaRP.png' % fac)
+        # print(metrics.average_precision_score(TF, TF_hat))
+        # print(metrics.roc_auc_score(TF, TF_hat))
+        plot_evaluation(TF, TF_hat, fac)
+
+    print "done..."
+
+    with open(fac + '_sqrt_fast_deletion.txt', 'w') as outf:
+        for i, elem in enumerate(cis_de_max):
+            print >>outf, '\t'.join(map(str, [chrom_cis[i], mid_cis[i], cis_de_max[i], TF[i], cis_delta_RP_max[i]]))
+
+    Rplot = '''
+    library(data.table)
+    hg38 = read.table('../src/marge/rp/test/hg38.tss', header = F)
+    refseq = gsub(":.+", "", hg38[,4])
+
+    PPARGc = scan("~/12_data/MARGE//siRNA/{0}_up_genes.txt", what=character())
+
+
+    PPARG = fread("{0}_sqrt_fast_deletion.txt",header=F)
+
+    PPARGd = hg38[toupper(refseq)%in%PPARGc,]
+    symbols = gsub(".+:", "", PPARGd[,4])
+    PPARGd = PPARGd[!duplicated(symbols),]
+
+    setkeyv(PPARG, c("V1", "V2"))
+
+    test4 = apply(as.matrix(PPARGd), 1, function(x) {{
+    return(PPARG[V1==x[1]&(abs(V2-as.numeric(x[2]))<=1e5)])
+    }})
+    pdf("{0}_deletion.pdf", width=16, height=10)
+    par(cex=1.2)
+    for (i in seq_along(test4)) {{
+        tmp = test4[[i]]
+    tmp[,m:=V2-PPARGd[i,2]]
+    if(dim(tmp)[1]>0) {{
+    plot(tmp[,m], tmp[,V5],  axes=F, main=paste0("Delta RP {0} differential gene TSS (100kb) ", paste0(PPARGd[i,], collapse=" ")), xlab="relative position to TSS", ylab="Delta RP after deletion of uDHS", pch=16, col='blue', xlim=c(-1e5, 1e5))
+    axis(1)
+    abline(v=0, col="red")
+    apply(as.matrix(tmp[V4==1]) , 1, function(x) abline(v=x[6]))
+    axis(2)
+    }}
+    }}
+    dev.off()
+    '''.format(fac)
+    with open("%s.R" % fac, 'w') as fout:
+        fout.write(Rplot)
+    os.system("Rscript %s.R" % fac)
+    os.system("rm %s.R" % fac)
+    return
+
+def plot_evaluation(TF, TF_hat, name):
+    fig = plt.figure()
+    fig.set_size_inches(6, 14)
+    ax = plt.subplot(2,1,1)
+    fpr, tpr, _ = metrics.roc_curve(TF, TF_hat, pos_label=1)
+    auc = metrics.auc(fpr, tpr)
+    plt.plot(fpr, tpr, color='blue', label="ROC AUC %s" % auc)
+    plt.title(name + " TF binding prediction \n from differential expression logistic regression ")
+    plt.xlabel('False positive rate')
+    plt.ylabel('True positive rate')
+    plt.legend(fontsize=12, loc=3, bbox_to_anchor=(0., 0.88, 1., .102), ncol=2, mode='expand',borderaxespad=0.)
+
+    ax = plt.subplot(2,1,2)
+    precision, recall, _ = metrics.precision_recall_curve(TF, TF_hat)
+    pr = metrics.average_precision_score(TF, TF_hat)
+    plt.plot(recall, precision, label='Precision-Recal AUC %s' % pr)
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.legend(fontsize=12, loc=3,bbox_to_anchor=(0., 0.88, 1., .102), ncol=2, mode='expand',borderaxespad=0.)
+    plt.subplots_adjust(left=0.1, bottom=0.05, right=0.95, top=0.9, wspace=0.05, hspace=0.18)
+    plt.savefig(name+'_TF_binding_prediction.png')
+    return auc, pr
+
+
+def weight(z):
+    halflife = 1e4
+    alpha  = -np.log(1.0/3.0)*1e5/halflife
+    w = 2.0*np.exp(-alpha*np.fabs(z)/1e5)/(1.0+np.exp(-alpha*np.fabs(z)/1e5))
+    return w
+
+
+def rp_diff( R, C, D ):
+    """
+    Needs to be calculated before normalization
+    Returns array of regulatory potentials after removing cis-regions in input.
+    R: m,
+    numpy array of regulatory potentials one n_samples
+    C: n_d x m,
+    numpy array of cis-regulatory element local counts (eg H3K27ac in UDHS) within range of TSS n_cis_elements x n_samples
+    D: n_d,
+    numpy array of distances of cis-elements from TSS n_cis_elements
+    function calulates new R array and dot product between new array and coef
+    """
+    # n_d,
+    W = weight(D)
+    # m x n_d * n_d, => n_d x m
+    Z = (C.transpose()*W).transpose()
+    # m, - n_d x m => n_d x m
+    return R-Z
+
+
+def load_motif_index(h5, cutoff=99):
+    if not os.path.exists(h5):
+        sys.exit(1)
+    with h5py.File(h5) as h5:
+        motifs = h5.keys()
+        for i in motifs:
+            # offset = h5['%s_offset' % i][...]
+            score = h5[i][...]
+            candidate, = np.where(score >= np.percentile(score, cutoff))
+            yield i, candidate
+            # yield i, offset[candidate], candidate
+
+def main():
+    p = argparse.ArgumentParser()
+    sub_parsers = p.add_subparsers(help='sub command help', dest='sub')
+
+    train_parser = sub_parsers.add_parser("train", help="run the training pipeline")
+    train_parser.add_argument('-X', required=True,
+                              help="input predictors as pandas DataFrame pkl format, \
+                              such as histone mark regulatory potential score matrix")
+    train_parser.add_argument('-Y', required=True,
+                              help="output response as pandas DataFrame pkl format, \
+                              such as E2 stimuli differential gene expression list")
+    train_parser.add_argument('-S', dest='sparse', default=False, action="store_true",
+                              help="use sparse connection or full connection(default)")
+    train_parser.add_argument('-L', dest='learning',
+                              help="learning ratio for gradient descent")
+    train_parser.add_argument('-H', dest='hidden', default=50,
+                              help="Hidden units number, suggest 2 for -S (feature mapping of sparse connection) mode\
+                                   , and 50 for full connection mode")
+    train_parser.add_argument('-O', dest='output', required=True,
+                              help="output directory path")
+
+    # semi-supervised with Kmeans and logistic regression/nn
+    cluster_train_parser = sub_parsers.add_parser("cluster_train", help="run the cluster_training pipeline")
+    cluster_train_parser.add_argument('-X', required=True,
+                                      help="input predictors as pandas DataFrame pkl format, \
+                                      such as histone mark regulatory potential score matrix")
+    cluster_train_parser.add_argument('-Y', required=True,
+                                      help="output response as pandas DataFrame pkl format, \
+                                      such as E2 stimuli differential gene expression list")
+    cluster_train_parser.add_argument('-S', dest='sparse', default=False, action="store_true",
+                                      help="use sparse connection or full connection(default)")
+    cluster_train_parser.add_argument('-L', dest='learning',
+                                      help="learning ratio for gradient descent")
+    cluster_train_parser.add_argument('-H', dest='hidden', default=50,
+                                      help="Hidden units number, suggest 2 for -S (feature mapping of sparse connection) mode\
+                                      , and 50 for full connection mode")
+    cluster_train_parser.add_argument('-O', dest='output', required=True,
+                                      help="output directory path")
+
+    # draw l1 penalty selected samples proportion
+    logistic_parser = sub_parsers.add_parser('logistic_feature', help="run logistic regression on all samples to get samples passing threshold")
+    logistic_parser.add_argument('-X', required=True,
+                              help="input predictors as pandas DataFrame pkl format, \
+                              such as histone mark regulatory potential score matrix")
+    logistic_parser.add_argument('-Y', required=True,
+                              help="output response as pandas DataFrame pkl format, \
+                              such as E2 stimuli differential gene expression list")
+
+    # explore sklearn adaboost
+    adaboost_parser = sub_parsers.add_parser('adaboost', help="run adaboost of logistic regression")
+    adaboost_parser.add_argument('-X', required=True,
+                              help="input predictors as pandas DataFrame pkl format, \
+                              such as histone mark regulatory potential score matrix")
+    adaboost_parser.add_argument('-Y', required=True,
+                              help="output response as pandas DataFrame pkl format, \
+                              such as E2 stimuli differential gene expression list")
+
+    # subtractive RP
+    # srp_parser = sub_parsers.add_parser('srp', help="subtractive RP")
+    # srp_parser.add_argument('-X', required=True,
+    #                         help="input predictors as pandas DataFrame pkl format, \
+    #                           such as histone mark regulatory potential score matrix")
+    # srp_parser.add_argument('-Y', required=True,
+    #                           help="output response as pandas DataFrame pkl format, \
+    #                           such as E2 stimuli differential gene expression list")
+    # srp_parser.add_argument('--factor', dest='factor', required=True, help="TF name")
+    # srp_parser.add_argument('-O', dest='output', required=True,
+    #                         help="output directory path")
+    # srp_parser.add_argument('-U', dest='uDHS', required=True,
+    #                         help="union DHS site bed file path")
+    # srp_parser.add_argument('-C', dest='cis', required=True,
+    #                         help="cis elements read count .h5 file path separated by comma , e.g., h3k27ac.h5,h3k4me3.h5")
+    # srp_parser.add_argument('-T', dest='TF_h5', required=True,
+    #                         help="TF binding binary value in uDHS regions h5 file path")
+    # srp_parser.add_argument('--deltalogit', dest='deltalogit', default=True, action="store_false",
+    #                         help="delta RP logistic regression or not")
+    # srp_parser.add_argument('--deltasimple', dest='deltasimple', default=True, action="store_false",
+    #                         help="delta RP linear regression or not")
+    # srp_parser.add_argument('--cluster', dest='cluster', default=False, action="store_true",
+    #                         help="cluster union DHS read count based on selected samples or not")
+    # srp_parser.add_argument('--combination', dest='combination', default=False, action="store_true",
+    #                         help="iterate all the combination of DNase, H3K27ac, H3K4me3 and H3K27me3")
+    # srp_parser.add_argument('--features', dest='features', default="DNase,H3K27ac,H3K4me3,H3K27me3",
+    #                         help="choose one combination of DNase,H3K27ac,H3K4me3,H3K27me3")
+
+    # Delta RP motif
+    motif = sub_parsers.add_parser('motif', help="motif delta RP method")
+    motif.add_argument('-d', required=True,
+                       help="differential gene list")
+    motif.add_argument('--output', required=True,
+                       help="output directory")
+    motif.add_argument('-f', required=True,
+                       help="TF name")
+    motif.add_argument('-c', required=True,
+                       help="configuration files for dependent data")
+    motif.add_argument('--chipseq', required=True,
+                       help="chipseq peak bed file")
+    motif.add_argument('--window', required=True,
+                       help="configuration files for dependent data")
+    motif.add_argument('--symbol', default=True, action="store_false",
+                       help="default: use -d as a text file, in which one refseq per line")
+
+    srp = sub_parsers.add_parser('srp', help="srp delta RP method")
+    srp.add_argument('-d', required=True,
+                       help="differential gene list")
+    srp.add_argument('--output', required=True,
+                       help="output directory")
+    srp.add_argument('-f', required=True,
+                       help="TF name")
+    srp.add_argument('-c', required=True,
+                       help="configuration files for dependent data")
+    srp.add_argument('--chipseq', required=True,
+                       help="chipseq peak bed file")
+    srp.add_argument('--limit', required=True,
+                       help="chipseq peak bed file")
+
+    args = p.parse_args()
+
+    # global parameters for auto-calibration
+    repeat_times = 3
+    seed = 9999
+    if args.sub == 'adaboost':
+        X = read_pandas(args.X)
+        Y = read_pandas(args.Y)
+        Y['symbols'] = Y.index.map(lambda x: x.split(':')[-1])
+        Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        X = normalize_rp(X.loc[Y.index, :])
+        assert (X.index == Y.index).all()
+        train_index, test_index = split_gene(X.index, seed, True)
+        factors = list(X.columns.levels[0])
+        X_train = X.iloc[train_index, :]
+        Y_train = Y.iloc[train_index, :]
+        X_test = X.iloc[test_index, :]
+        Y_test = Y.iloc[test_index, :]
+        seed = 9999
+        adaboostSKlearn(X_train, Y_train, X_test, Y_test, seed)
+
+    if args.sub == 'logistic_feature':
+        X = read_pandas(args.X)
+        Y = read_pandas(args.Y)
+        Y['symbols'] = Y.index.map(lambda x: x.split(':')[-1])
+        Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        X = normalize_rp(X.loc[Y.index, :])
+        assert (X.index == Y.index).all()
+        train_index, test_index = split_gene(X.index, seed, True)
+        factors = list(X.columns.levels[0])
+        X_train = X.iloc[train_index, :]
+        Y_train = Y.iloc[train_index, :]
+        X_test = X.iloc[test_index, :]
+        Y_test = Y.iloc[test_index, :]
+        seed = 999
+        l1_feature_exploration(seed, X_train, Y_train, X_test, Y_test)
+
+    if args.sub == 'cluster_train':
+        X = read_pandas(args.X)
+        # Y = read_pandas(args.Y)
+        with open(args.Y) as inf:
+            symbols = [l.strip() for l in inf]
+        Y = pd.DataFrame(np.zeros((X.shape[0],1)), dtype=np.int32, index=X.index, columns=[os.path.basename(args.Y).replace('_genes.txt', '')])
+        Y['refseq'] = Y.index.map(lambda x: x.split(':')[-2])
+        Y['symbols'] = Y.index.map(lambda x: x.split(':')[-1])
+        Y.ix[Y.refseq.isin(symbols), 0] = 1
+        Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        Y.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+
+        # get id intersection
+        idmap = {}
+        for index, i in enumerate(X.columns.get_level_values(1)):
+            idmap[i] = index
+        keys = []
+        X_new = []
+        for h5 in glob.glob(os.path.expanduser("~/12_data/MARGE/*h5")):
+            ids = []
+            with h5py.File(h5, 'r') as store:
+                keys = store.keys() 
+                keys = list(set(keys) & set(list(X.columns.get_level_values(1))))                
+                for k in keys:
+                    ids.append(idmap[k])
+                X_new.append(X.iloc[:,ids])
+        X = pd.concat(X_new, axis=1)
+        profile_cluster_heatmap(seed, repeat_times, X, Y)
+
+    if args.sub == 'train':
+        X = read_pandas(args.X)
+
+        # TF binding prediction
+        X = X[['DNase', 'H3K27ac']]
+
+
+        # Y = read_pandas(args.Y)
+        with open(args.Y) as inf:
+            symbols = [l.strip() for l in inf]
+
+        print(X.shape)
+        Y = pd.DataFrame(np.zeros((X.shape[0],1)), dtype=np.int32, index=X.index, columns=[os.path.basename(args.Y).replace('_up_genes.txt', '')])
+
+        Y['refseq'] = Y.index.map(lambda x: x.split(':')[-2])
+        Y['symbols'] = Y.index.map(lambda x: x.split(':')[-1])
+        Y.ix[Y.refseq.isin(symbols), 0] = 1
+
+        print(len(symbols))
+        print(Y.sum())
+        # Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        # Y.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+        diff = Y.ix[Y.iloc[:,0].values == 1].copy()
+        # print(diff)
+        non = Y.ix[Y.iloc[:,0].values == 0].copy()
+
+        diff.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        diff.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+
+        non.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        non.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+
+        del Y
+        # Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+        # Y.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+        Y = pd.concat([diff, non], axis=0)
+
+
+        print(Y.sum())
+
+        idmap = {}
+        for index, i in enumerate(X.columns.get_level_values(1)):
+            idmap[i] = index
+        keys = []
+
+        X_new = []
+        for h5 in glob.glob(os.path.expanduser("~/12_data/MARGE/*h5")):
+            ids = []
+            with h5py.File(h5, 'r') as store:
+                keys = store.keys()
+                keys = list(set(keys) & set(list(X.columns.get_level_values(1))))
+                for k in keys:
+                    ids.append(idmap[k])
+                X_new.append(X.iloc[:,ids])
+        X = pd.concat(X_new, axis=1)
+
+        # Y['symbols'] = Y.index.map(lambda x: x.split(':')[-1])
+        # Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+
+
+        # train_nn(seed, repeat_times, args, X, Y)
+        for i in range(1, 5):
+            features = list(combinations(['H3K27ac', 'H3K4me3', 'DNase', 'H3K27me3'], i))
+            print(features)
+            for j in features:
+                train_nn_tfbs(seed, repeat_times, args, X[list(j)], Y, j, args.output, os.path.basename(args.Y.upper().strip()))
+
+    #old code with pandas dataframe
+    #if args.sub == "srp":
+    #    factormap = {}
+
+    #    for f in args.cis.split(','):
+    #        if 'DNase' in f:
+    #            factormap['DNase'] = f
+    #        if 'H3K4me3' in f:
+    #            factormap['H3K4me3'] = f
+    #        if 'H3K27me3' in f:
+    #            factormap['H3K27me3'] = f
+    #        if 'H3K27ac' in f:
+    #            factormap['H3K27ac'] = f
+
+    #    X = read_pandas(args.X)
+
+    #    # get id intersection
+    #    idmap = {}
+    #    for index, i in enumerate(X.columns.get_level_values(1)):
+    #        idmap[i] = index
+    #  
+    #    filter_data = False; ids = []
+    #    # filter good quality for DNase 
+    #    if filter_data:
+    #        with open('good_DNase.txt') as inf:
+    #            for good_dnase in inf:
+    #                good_dnase = good_dnase.strip().split('_')[0]
+    #                ids.append(os.path.basename(good_dnase))
+
+    #        ids = set(X.columns.get_level_values(1)) & set(ids)
+    #        dnase_ids = []
+    #        for z in ids:
+    #            dnase_ids.append(idmap[z])
+    #        X = X.iloc[:, dnase_ids]
+    #        print(len(dnase_ids))
+    #        print(len(X.columns.get_level_values(1)))
+
+    #    Y = read_pandas(args.Y)
+    #    with open(args.Y) as inf:
+    #        symbols = [l.strip() for l in inf]
+    #    # if one transcript is differentially expressed (1)
+    #    # then the unique gene is differentially expressed (1)
+    #    # we turn all the transcripts for that unique gene to 1
+    #    Y = pd.DataFrame(np.zeros((X.shape[0],1)), dtype=np.int32, index=X.index,
+    #                     columns=[os.path.basename(args.Y).replace('_genes.txt', '')])
+    #    Y['refseq'] = Y.index.map(lambda x: x.split(':')[-2])
+    #    Y['symbols'] = Y.index.map(lambda x: x.split(':')[-1])
+    #    Y.ix[Y.refseq.isin(symbols), 0] = 1
+    #    diff = Y.ix[Y.iloc[:,0].values == 1].copy()
+    #    non = Y.ix[Y.iloc[:,0].values == 0].copy()
+    #    diff.drop_duplicates(subset='symbols', keep='first', inplace=True)
+    #    diff.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+    #    non.drop_duplicates(subset='symbols', keep='first', inplace=True)
+    #    non.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+    #    del Y
+    #    # Y.drop_duplicates(subset='symbols', keep='first', inplace=True)
+    #    # Y.drop(labels=['refseq', 'symbols'], axis=1, inplace=True)
+
+    #    idmap = {}
+    #    for index, i in enumerate(X.columns.get_level_values(1)):
+    #        idmap[i] = index
+    #    keys = []
+
+    #    Y = pd.concat([diff, non], axis=0)
+    #    X_new = []
+    #    # for h5 in glob.glob(os.path.expanduser("~/12_data/MARGE/*h5")):
+    #    for h5 in args.cis.split(','):
+    #        ids = []
+    #        with h5py.File(h5, 'r') as store:
+    #            keys = store.keys()
+    #            keys = list(set(keys) & set(list(X.columns.get_level_values(1))))
+    #            if keys:
+    #                for k in keys:
+    #                    ids.append(idmap[k])
+    #                X_new.append(X.iloc[:,ids])
+
+    #    X = pd.concat(X_new, axis=1)
+
+    #    if args.combination:
+    #        n = 0
+    #        for i in range(1, 5):
+    #            # features = list(combinations(['H3K27ac', 'H3K4me3', 'DNase', 'H3K27me3'], i))
+    #            features = list(combinations(args.features.split(','), i))
+    #            for j in features:
+    #                n += 1
+    #                print(j)
+    #                subtractive_RP_complex(factormap, args.TF_h5, args.uDHS, args.cis, seed, repeat_times,
+    #                                       X[list(j)],
+    #                                       Y,
+    #                                       args.output, os.path.basename(args.factor.upper().strip()), j,
+    #                                       args.deltalogit, args.deltasimple, args.cluster)
+    #    else:
+    #        features = args.features.split(',')
+    #        # subtractive_RP_complex(factormap, args.TF_h5, args.uDHS, args.cis, seed, repeat_times,
+    #        #                        X[features],
+    #        #                        Y, args.output, os.path.basename(args.factor.upper().strip()),
+    #        #                        features,
+    #        #                        args.deltalogit, args.deltasimple, args.cluster)
+    #        #samplesNumberEffect(factormap, args.TF_h5, args.uDHS, args.cis, seed, repeat_times,
+    #        #                       X[features],
+    #        #                       Y, args.output, os.path.basename(args.factor.upper().strip()),
+    #        #                       features,
+    #        #                       args.deltalogit, args.deltasimple, args.cluster)
+    #        samplesNumberEffectWithDeltaRP(factormap, args.TF_h5, args.uDHS, args.cis, seed, repeat_times,
+    #                               X[features],
+    #                               Y, args.output, os.path.basename(args.factor.upper().strip()),
+    #                               features,
+    #                               args.deltalogit, args.deltasimple, args.cluster)
+    #        # transductLogit(factormap, args.TF_h5, args.uDHS, args.cis, seed, repeat_times,
+    #        #                X[features],
+    #        #                Y, args.output, os.path.basename(args.factor.upper().strip()),
+    #        #                features,
+    #        #                args.deltalogit, args.deltasimple, args.cluster)
+    #        #Hist(factormap, args.TF_h5, args.uDHS, args.cis, seed, repeat_times,
+    #        #               X[features],
+    #        #               Y, args.output, os.path.basename(args.factor.upper().strip()),
+    #        #               features,
+    #        #               args.deltalogit, args.deltasimple, args.cluster)
+
+    # if args.sub == "srp":
+    #     if os.path.exists(args.c):
+    #         for feat_num in range(1, int(args.limit)):
+    #             mdp = MotifDeltaRP(args.output, args.d, args.c, args.chipseq, 1000)
+    #             mdp.build_expression_model(feat_num)
+    #             mdp.load_read_count_validate_exp_model(args.f, feat_num)
+
+    if args.sub == 'motif':
+        if os.path.exists(args.c):
+            mdp = MotifDeltaRP(args.output, args.d, args.c, args.chipseq, 1000, args.symbol, remove1kb=False)
+            mdp.build_expression_model(50)
+            exp_df = mdp.load_read_count_validate_exp_model(args.f, 50)
+            delta = mdp.motif_delta_rp()
+            mdp2 = MotifDeltaRP(args.output, args.d, args.c, args.chipseq, 1000, args.symbol, remove1kb=True)
+            mdp2.build_expression_model(50)
+            exp_df2 = mdp2.load_read_count_validate_exp_model(args.f, 50)
+            delta2 = mdp2.motif_delta_rp()
+            if not args.symbol:
+                output = pd.concat([mdp.diff, exp_df, delta, exp_df2, delta2], axis=1)
+                output.to_csv(mdp.output_prefix + "_combined.csv")
+
+            # mdp.plot()
+
+if __name__ == "__main__":
+    main()
+
+

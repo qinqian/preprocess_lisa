@@ -1,0 +1,40 @@
+import glob
+import os
+
+SYMBOLS = list(map(lambda x: x.split('.')[0], glob.glob("*symbol")))
+
+# epis = "H3K27ac,DNase,H3K4me1,H3K4me3,H3K4me2,H3K27me3,H3K36me3,H3K9me3,ATAC-seq,H3K9ac".split(",")
+epis = "H3K27ac,DNase,H3K4me1".split(",")
+
+TARGETS = expand("{sample}_html", sample=SYMBOLS)
+
+rule all:
+    input: TARGETS
+
+rule clean:
+    shell: "rm -rf *fs* *delta* *coef *margerp *json *_html *log"
+
+rule lisa:
+    input:
+        "{sample}.symbol"
+    output:
+        temp(os.path.expanduser("~/public_html/marge2/{sample}DNase_abscoef_6sample_{epi}"))
+    params:
+        name="{sample}",
+        epi="{epi}",
+    log:
+        "{sample}.log"
+    shell:
+        "OMP_NUM_THREADS=8 lisa logit --histone {params.epi} --gene {input} --tf no --name {params.name}"
+        " --species hg38 -O {output} --DNase --top 10 2>{log} "
+
+rule merge_lisa:
+    input:
+        expand(os.path.expanduser("~/public_html/marge2/{{sample}}DNase_abscoef_6sample_{epi}"), epi=epis)
+    output:
+        name="{sample}_html"
+    log:
+        "{sample}.log"
+    run:
+        shell("mkdir -p %s && cp -nrf %s %s" % (output.name, ' '.join(map(lambda x: "%s/*"%x, input)), output.name))
+

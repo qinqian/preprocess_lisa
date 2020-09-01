@@ -1,0 +1,27 @@
+#!/usr/bin/env python
+from h5py import File
+import os
+from numpy import percentile
+from numpy import where, intersect1d
+
+meta = {}
+with open('DC_samples_id.xls') as inf:
+    for line in inf:
+        line = line.strip().split('\t')
+        meta[line[0]] = line[12]
+
+factor = {'AR': '37106', 'ESR1': '2301', 'PPARG': '4495', 'NOTCH': '43101'}
+with File(os.path.expanduser("~/12_data/MARGE/hg38_homer2_motifs_raw.h5")) as inf:
+     for m in inf.keys():
+        print(m)
+        if m.endswith('offset'):
+           continue
+
+        scores = inf[m][...]
+        score = percentile(scores, 90)
+        index, = where(scores>=score)
+        with File('/mnt/Storage/home/qinq/12_data/MARGE/hg38_UDHS_TF_intersect.h5') as inf2:
+            for f in factor.keys():
+                fout = open(f+'.txt', 'a')
+                print >>fout, '\t'.join(map(str, [m.upper(), len(index), len(inf2[factor[f]]), len(intersect1d(inf2[factor[f]][...]-1, index))]))
+                fout.close()

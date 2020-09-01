@@ -1,0 +1,7 @@
+1. integrate 10 marks with python implemented RRA and add a d3js summary page.
+2. get back single cis-element deletion for predicting TFBS
+4. add the predicted cr/tf and both back to the TF peak deletion mode
+5. combine 10 marks for l1 regression
+6. test sample size, gene number effect on DE prediction, TFBS prediction and TF prioritization
+7. try CREEDS(up,down and both), NIA, harmonizome comprehensively
+8. GC content back...

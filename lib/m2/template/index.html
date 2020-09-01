@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<head>
+  <title>MARGE2 $study_name</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="bootstrap.min.css">
+  <script src="jquery.min.js"></script>
+  <script src="bootstrap.min.js"></script>
+  <script src="d3.v4.min.js"></script>
+  <style>
+  .bar--positive {
+    fill: steelblue;
+}
+.bar--negative {
+    fill: red;
+}
+
+body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    margin: 0;
+}
+
+svg {
+    margin-left:auto;
+    margin-right:auto;
+    display:block;
+}
+
+#show-length {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+}
+
+.links {
+    fill: none;
+    stroke: #000;
+}
+
+.link-extensions {
+    fill: none;
+    stroke: #000;
+    stroke-opacity: .25;
+}
+
+.labels {
+    font: 12px sans-serif;
+}
+
+div {
+    text-align:center;
+}
+
+text {
+    text-shadow: 0 1px 0 #fff, 0 -1px 0 #fff, 1px 0 0 #fff, -1px 0 0 #fff;
+    font-size: 9px;
+    font-family: sans-serif;
+}
+
+.link--active {
+    stroke: #000 !important;
+    stroke-width: 2.5px;
+}
+
+.link-extension--active {
+    stroke-opacity: 1;
+}
+
+.label--active {
+    font-weight: bold;
+}
+
+.arc2 {
+    opacity: 1;
+    stroke: red;
+    stroke-width: 0.5px;
+}
+
+.arc {
+    opacity: 1;
+    stroke: blue;
+    stroke-width: 0.5px;
+}
+
+  </style>
+
+</head>
+
+<body>
+
+  <div>
+
+    <!-- Nav tabs -->
+    <ul class="nav nav-tabs" role="tablist">
+      <li role="presentation" class="active"><a href="#H3K27ac" aria-controls="home" role="tab" data-toggle="tab">H3K27ac</a></li>
+      <li role="presentation"><a href="#H3K4me1" aria-controls="messages" role="tab" data-toggle="tab">H3K4me1</a></li>
+      <li role="presentation"><a href="#H3K4me2" aria-controls="messages" role="tab" data-toggle="tab">H3K4me2</a></li>
+      <li role="presentation"><a href="#H3K4me3" aria-controls="messages" role="tab" data-toggle="tab">H3K4me3</a></li>
+      <li role="presentation"><a href="#H3K9ac" aria-controls="messages" role="tab" data-toggle="tab">H3K9ac</a></li>
+      <li role="presentation"><a href="#DNase" aria-controls="profile" role="tab" data-toggle="tab">DNase-seq</a></li>
+      <li role="presentation"><a href="#ATAC-seq" aria-controls="messages" role="tab" data-toggle="tab">ATAC-seq</a></li>
+      <li role="presentation"><a href="#H3K9me3" aria-controls="messages" role="tab" data-toggle="tab">H3K9me3</a></li>
+      <li role="presentation"><a href="#H3K27me3" aria-controls="messages" role="tab" data-toggle="tab">H3K27me3</a></li>
+      <li role="presentation"><a href="#H3K36me3" aria-controls="messages" role="tab" data-toggle="tab">H3K36me3</a></li>
+    </ul>
+    <div class="tab-content">
+      <div role="tabpanel" class="tab-pane fade in active" id="H3K27ac">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div role="tabpanel" class="tab-pane fade" id="DNase">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar2"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc2"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree2"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree2"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div role="tabpanel" class="tab-pane fade" id="DNase">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar2"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc2"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree2"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree2"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div role="tabpanel" class="tab-pane fade" id="DNase">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar2"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc2"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree2"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree2"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div role="tabpanel" class="tab-pane fade" id="H3K4me1">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar3"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc3"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree3"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree3"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" class="tab-pane fade" id="H3K9ac">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar7"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc7"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree7"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree7"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+
+      <div role="tabpanel" class="tab-pane fade" id="ATAC-seq">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar6"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc6"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree6"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree6"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+
+      <div role="tabpanel" class="tab-pane fade" id="H3K4me2">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar5"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc5"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree5"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree5"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" class="tab-pane fade" id="H3K27me3">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar8"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc8"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree8"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree8"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" class="tab-pane fade" id="H3K36me3">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar9"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc9"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree9"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree9"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" class="tab-pane fade" id="H3K9me3">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar10"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc10"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree10"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree10"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" class="tab-pane fade" id="H3K4me3">
+        <div class="container-fluid">
+          <div class="row">
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">Samples selected</div>
+                <div class="panel-body">
+                  <svg class="bar4"></svg>
+                </div>
+              </div>
+            </div>
+            <div class="col-sm-6">
+              <div class="panel panel-default">
+                <div class="panel-heading">ROC AUC Curve</div>
+                <div class="panel-body">
+                  <svg class="auc4"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">Motif Delta RP</div>
+                <svg class="tree4"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-sm-12">
+              <div class="panel panel-default">
+                <div class="panel-heading">ChIP-seq delta RP and BETA</div>
+                <div class="panel-body">
+                  <svg class="dc_tree4"></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <!-- <label id="show-length"> -->
+  <!--   <input type="checkbox"> Show branch length -->
+  <!-- </label> -->
+  <script src="marge2$dnase.js"></script>
+  <script>
+    run_all("$study_name");
+  </script>
+</body>
+</html>
+

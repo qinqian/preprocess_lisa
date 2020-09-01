@@ -1,0 +1,41 @@
+import os
+import pickle
+import codecs
+ann="/data/home/qqin/01_Projects/Programming/dc2/scripts/samples_directory.txt"
+windows="/data/home/qqin/seqpos2/hg38_window100bp.bed"
+ids = []
+with codecs.open('../hg38_best_dc_tfcr_basedon_frip_peak_dhs_all_nonhm_nonca.xls', encoding='utf-8', errors='ignore') as fin:
+    fin.readline()
+    for line in fin:
+        line = line.strip().split()
+        ids.append(int(line[0]))
+
+with codecs.open(ann, 'rb') as inf:
+    ann_dict = pickle.load(inf, encoding='bytes')
+
+dirs = [ ann_dict[i].decode('utf-8') for i in ids ]
+print(len(dirs))
+
+dirclean = []
+idsclean = []
+for i,j in zip(dirs, ids):
+    if os.path.exists('{dir}/{id}_peaks.xls'.format(dir=i, id=j)):
+        dirclean.append(i)
+        idsclean.append(j)
+
+print(len(dirclean))
+ts = expand('{id}_beta_peakfold5.tab', id=idsclean)
+
+rule all:
+    input: ts
+
+rule beta_5fold:
+    input:  lambda wildcards: os.path.join(ann_dict[int(wildcards.id)].decode('utf-8'), '%s_peaks.xls' % wildcards.id)
+    output: '{id}_beta_peakfold5.tab'
+    params: sp="/data/home/qqin/MARGE/scripts/marge2/histonerp/hg38.tss", ann_dict=ann_dict
+    shell: """
+    echo {wildcards.id}
+    cp {input} .
+    python ../RegPotential_lisa_weight.py -t {input} -g {params.sp} -n {output}
+    """
+

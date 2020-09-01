@@ -1,0 +1,113 @@
+import os
+import numpy as np
+import gzip
+from pkg_resources import resource_filename
+configfile: "$config"
+epi = []
+labels = []
+ts = []
+for i in config['samples']:
+    epi += [i] * len(config["samples"][i])
+    labels += list(config["samples"][i].keys())
+    # epi = [i] * len(config["samples"][i])
+    # labels = list(config["samples"][i].keys())
+    # ts += expand("{epi}/{sample}.bam", epi=i, sample=labels)
+
+ts += expand("{epi}/{sample}.bam", zip, epi=epi, sample=labels)
+ts += expand("{epi}/{sample}.bw", zip, epi=epi, sample=labels)
+ts += expand("{epi}/{sample}.h5", zip, epi=epi, sample=labels)
+
+ts += expand("%s_{merge_epi}.h5" % "$prefix", merge_epi=list(set(epi)))
+ts.append("$html_out")
+print(ts)
+
+rule all:
+    input: ts
+
+rule clean:
+    shell: "rm -rf *fs* *top10* *delta*batch* *margerp *coef *_html *h5 *json"
+
+rule bwa:
+    input:
+        fq=lambda wc: config["samples"][wc.epi][wc.sample]
+    output:
+        "{epi}/{sample}.bam"
+    params:
+        index=config["index"]
+    threads: 4
+    priority: 50
+    conda:
+        "$conda"
+    log:
+        os.path.join('logs', '$prefix.log')
+    message: "--- mapping fastq files for different epigenome profile"
+    shell:
+        "echo {input} {output}"
+        "which bwa && which samtools && lisa_mapping {params.index} {input.fq} {threads} {wildcards.epi}/{wildcards.sample} 2>{log}"
+
+rule bigwiggle:
+    input:
+        bam="{epi}/{sample}.bam",
+        chrom="$chrom"
+    output:
+        "{epi}/{sample}.bw"
+    priority: 30
+    conda:
+        "$conda"
+    log:
+        os.path.join('logs', '$prefix.log')
+    shell:
+        "lisa_bw {input.bam} {input.chrom} {output} 2>>{log}"
+
+rule SampleHDF5:
+    input:
+        bw="{epi}/{sample}.bw",
+        chrom="$chrom"
+    output:
+        h5=temp("{epi}/{sample}.h5"),
+        rp=temp("{epi}/{sample}.rp"),
+        ct=temp("{epi}/{sample}.txt"),
+    priority: 10
+    params:
+        order="$originalorder",
+        sp='$sp',
+        bin1kb='$bin1kb',
+    script:
+        "lisa_h5.py"
+
+def merge_samples(wc):
+    # print(wc.merge_epi)
+    one_factor_h5 = list(config["samples"][wc.merge_epi].keys())
+    input_h5 = list(map(lambda x: os.path.join(wc.merge_epi, "%s.h5"%x), one_factor_h5))
+    return one_factor_h5, input_h5
+
+rule merge:
+    input:
+        h5=lambda wildcards: merge_samples(wildcards)[1],
+        chrom="$chrom"
+    output:
+        fh5="%s_{merge_epi}.h5" % "$prefix"
+    priority: 5
+    message: "merging hdf5 for individual mark"
+    params: prefix="$prefix", labels=lambda wildcards: merge_samples(wildcards)[0]
+    script:
+        "lisa_merge.py"
+
+rule KnockOut:
+    input:
+        fh5="%s_{merge_epi}.h5" % "$prefix"
+    output:
+        report=temp("{merge_epi}_html")
+    priority: 1
+    message: "run regression and TF prioritization"
+    params: prefix="$prefix"
+    log:
+        os.path.join('logs', '$prefix.log')
+    shell:
+        "lisa logit --histone {wildcards.merge_epi} -O {wildcards.merge_epi}_html --name {params.prefix} --gene $gene --tf no --species $sp --additional_h5 {input.fh5} 2>>{log}"
+
+rule mergeD3:
+    input: expand("{merge_epi}_html", merge_epi=list(set(epi)))
+    output: protected("$html_out")
+    run:
+        shell("mkdir -p %s && cp -nrf %s %s" % (output, ' '.join(map(lambda x: "%s/*"%x, input)), output))
